@@ -667,11 +667,6 @@ where
             trace!("signed invoice refused: bad request id length");
             return Err(lnurl_error("invalid request id"));
         }
-        let replay_key = format!("{recipient_spark_pubkey}:{}", payload.request_id);
-        if !claim_signed_invoice_request_id(&replay_key) {
-            warn!("signed invoice replay rejected for request_id '{}'", payload.request_id);
-            return Err(lnurl_error("request id already used"));
-        }
 
         let expiry_secs_tag = payload.expiry_secs.unwrap_or(0);
         let canonical = format!(
@@ -690,7 +685,9 @@ where
         // validate() proves the signature; these checks prove authority over
         // THIS account: either the identity key itself, or (D2) an active
         // delegated grant bound to the account.
-        if signer.to_string() != recipient_spark_pubkey {
+        let authorized = if signer.to_string() == recipient_spark_pubkey {
+            true
+        } else {
             let now_secs = i64::try_from(crate::time::now_u64()).unwrap_or_default();
             let grant = state
                 .db
@@ -709,12 +706,24 @@ where
                         "signed invoice authorized via delegated key (granted by {})",
                         grant.owner_pubkey
                     );
+                    true
                 }
                 None => {
                     warn!("signed invoice rejected: signer is neither recipient nor active delegate");
-                    return Err(lnurl_error("invalid signature"));
+                    false
                 }
             }
+        };
+        if !authorized {
+            return Err(lnurl_error("invalid signature"));
+        }
+
+        // Replay guard runs only after authorization so unauthenticated
+        // garbage cannot burn legitimate request ids.
+        let replay_key = format!("{recipient_spark_pubkey}:{}", payload.request_id);
+        if !claim_signed_invoice_request_id(&replay_key) {
+            warn!("signed invoice replay rejected for request_id '{}'", payload.request_id);
+            return Err(lnurl_error("request id already used"));
         }
 
         let expiry = callback_expiry_for_provider(
