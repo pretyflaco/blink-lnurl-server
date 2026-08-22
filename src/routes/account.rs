@@ -432,9 +432,17 @@ where
                 expires_at,
             })
             .await
-            .map_err(|e| {
-                error!("failed to store delegated grant: {e:?}");
-                internal_error()
+            .map_err(|e| match e {
+                LnurlRepositoryError::DelegatedGrantConflict => (
+                    StatusCode::CONFLICT,
+                    Json(Value::String(
+                        "delegated key already granted by a different account".into(),
+                    )),
+                ),
+                e => {
+                    error!("failed to store delegated grant: {e:?}");
+                    internal_error()
+                }
             })?;
 
         debug!(
@@ -470,6 +478,10 @@ where
                 Json(Value::String("invalid pubkey".into())),
             ));
         }
+        // Grants are stored under the normalized (compressed) pubkey form;
+        // the lookup must normalize too or a non-compressed encoding of the
+        // same key would silently match nothing.
+        let delegated_normalized = parse_pubkey(&delegated_pubkey)?.to_string();
 
         let message = format!("revoke:{delegated_pubkey}");
         let owner = validate(
@@ -486,7 +498,7 @@ where
             .db
             .revoke_delegated_grant(
                 &owner.to_string(),
-                &delegated_pubkey,
+                &delegated_normalized,
                 i64::try_from(now).unwrap_or_default(),
             )
             .await
@@ -2393,5 +2405,52 @@ use serde_json::{Value, json};
         assert_eq!(record.mode, Some(AccountMode::Enhanced));
         assert_eq!(record.mode_source, Some(ModeSource::Migration));
         assert!(record.country.is_none());
+    }
+
+    // -- D2 delegated-grant ownership (blink-wip#1158) ----------------------
+
+    fn new_grant(delegated: &str, owner: &str) -> NewDelegatedGrant {
+        NewDelegatedGrant {
+            delegated_pubkey: delegated.to_string(),
+            account_id: format!("acct_of_{owner}"),
+            owner_pubkey: owner.to_string(),
+            created_at: 1_700_000_000,
+            expires_at: 1_800_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_upsert_allows_the_same_owner_to_rotate() {
+        let repo = MockRepository::default();
+        repo.upsert_delegated_grant(&new_grant("02aa", "owner_a"))
+            .await
+            .expect("initial grant");
+        let rotated = repo
+            .upsert_delegated_grant(&new_grant("02aa", "owner_a"))
+            .await
+            .expect("same-owner re-grant is a rotation, not a conflict");
+        assert_eq!(rotated.owner_pubkey, "owner_a");
+    }
+
+    #[tokio::test]
+    async fn grant_upsert_rejects_rebinding_to_a_different_owner() {
+        let repo = MockRepository::default();
+        repo.upsert_delegated_grant(&new_grant("02bb", "owner_a"))
+            .await
+            .expect("initial grant");
+        let hijack = repo
+            .upsert_delegated_grant(&new_grant("02bb", "owner_b"))
+            .await;
+        assert!(
+            matches!(hijack, Err(LnurlRepositoryError::DelegatedGrantConflict)),
+            "a different owner must not rebind the delegated key: {hijack:?}"
+        );
+        // and the original binding is untouched
+        let row = repo
+            .get_delegated_grant("acct_of_owner_a", "02bb")
+            .await
+            .expect("lookup")
+            .expect("row still bound to the original account");
+        assert_eq!(row.owner_pubkey, "owner_a");
     }
 }

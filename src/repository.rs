@@ -31,6 +31,8 @@ pub enum LnurlRepositoryError {
     InvalidAccountMode,
     #[error("mode request is not newer than the last accepted one")]
     StaleModeTimestamp,
+    #[error("delegated key is already granted by a different account")]
+    DelegatedGrantConflict,
     #[error("database error: {0}")]
     General(anyhow::Error),
 }
@@ -525,6 +527,10 @@ pub trait LnurlRepository {
 
     /// D2: insert or replace a delegated receive grant. Replacement is
     /// owner-signed so rotating/expiring grants is the owner's choice.
+    /// Returns [`LnurlRepositoryError::DelegatedGrantConflict`] when the
+    /// delegated key is already bound to a *different* owner: without that
+    /// guard any registered account could rebind (and thereby disable)
+    /// another account's grant, since the delegated pubkey is the PK.
     async fn upsert_delegated_grant(
         &self,
         _grant: &NewDelegatedGrant,

@@ -1005,7 +1005,9 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         &self,
         grant: &crate::repository::NewDelegatedGrant,
     ) -> Result<crate::repository::DelegatedGrant, LnurlRepositoryError> {
-        sqlx::query(
+        // The conflict update is restricted to rows owned by the same key:
+        // a re-grant by a *different* owner must not rebind (hijack) the row.
+        let result = sqlx::query(
             "INSERT INTO delegated_grants (delegated_pubkey, account_id, owner_pubkey, created_at, expires_at)
              VALUES ($1, $2, $3, $4, $5)
               ON CONFLICT(delegated_pubkey) DO UPDATE
@@ -1013,7 +1015,8 @@ impl crate::repository::LnurlRepository for LnurlRepository {
               ,   owner_pubkey = excluded.owner_pubkey
               ,   created_at = excluded.created_at
               ,   expires_at = excluded.expires_at
-              ,   revoked_at = NULL",
+              ,   revoked_at = NULL
+              WHERE delegated_grants.owner_pubkey = excluded.owner_pubkey",
         )
         .bind(&grant.delegated_pubkey)
         .bind(&grant.account_id)
@@ -1022,6 +1025,9 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(grant.expires_at)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(LnurlRepositoryError::DelegatedGrantConflict);
+        }
         Ok(crate::repository::DelegatedGrant {
             delegated_pubkey: grant.delegated_pubkey.clone(),
             account_id: grant.account_id.clone(),
