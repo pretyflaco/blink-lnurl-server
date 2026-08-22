@@ -1094,6 +1094,84 @@ mod tests {
     use super::*;
     use crate::routes::test_support::*;
     use serde_json::{Value, json};
+
+    // -- D1 signed-invoice helpers (blink-wip#1158) --------------------------
+    // The full authorize+mint path is covered by live E2E (see the LNbits dev
+    // box); the Spark provider mints via the SSP over the network so it is not
+    // reproducible offline. These cover the deterministic building blocks.
+
+    #[test]
+    fn signed_description_hash_accepts_only_64_lowercase_hex() {
+        let valid = "a".repeat(64);
+        assert!(parse_signed_description_hash(&valid).is_some());
+        let mixed = format!("{}{}", "0123456789abcdef".repeat(3), "0123456789abcdef");
+        assert!(parse_signed_description_hash(&mixed).is_some());
+
+        // too short / too long
+        assert!(parse_signed_description_hash(&"a".repeat(63)).is_none());
+        assert!(parse_signed_description_hash(&"a".repeat(65)).is_none());
+        // uppercase rejected (canonical form only)
+        assert!(parse_signed_description_hash(&"A".repeat(64)).is_none());
+        // non-hex rejected
+        assert!(parse_signed_description_hash(&"g".repeat(64)).is_none());
+    }
+
+    #[test]
+    fn signed_description_hash_bytes_roundtrip() {
+        let hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let bytes = parse_signed_description_hash(hex).expect("valid hash");
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[1], 0x11);
+        assert_eq!(bytes[31], 0xff);
+    }
+
+    #[test]
+    fn signed_invoice_replay_id_claimed_once() {
+        let key = format!("pk:{}", uuid_like());
+        assert!(claim_signed_invoice_request_id(&key), "first claim succeeds");
+        assert!(
+            !claim_signed_invoice_request_id(&key),
+            "second claim of same key is rejected"
+        );
+        // a different key is independent
+        let other = format!("pk:{}", uuid_like());
+        assert!(claim_signed_invoice_request_id(&other));
+    }
+
+    #[test]
+    fn signed_invoice_request_rejects_unknown_fields() {
+        let base = json!({
+            "amount_msat": 1000u64,
+            "description_hash": "a".repeat(64),
+            "request_id": "abc",
+            "pubkey": "02aa",
+            "timestamp": 1_700_000_000u64,
+            "signature": "3044",
+        });
+        // clean request deserializes
+        assert!(serde_json::from_value::<SignedInvoiceRequest>(base.clone()).is_ok());
+
+        // smuggling metadata/description/nostr must fail (deny_unknown_fields)
+        for field in ["metadata", "description", "nostr"] {
+            let mut bad = base.clone();
+            bad[field] = json!("evil");
+            assert!(
+                serde_json::from_value::<SignedInvoiceRequest>(bad).is_err(),
+                "field '{field}' must be rejected"
+            );
+        }
+    }
+
+    // small non-crypto unique string generator for replay-key tests
+    fn uuid_like() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{n}")
+    }
+
     // -- Public LNURL provider-dispatch compatibility -------------------------
 
     #[test]
