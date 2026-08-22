@@ -687,11 +687,34 @@ where
         )
         .await?;
 
-        // validate() proves the signature; this check proves ownership of
-        // THIS account.
+        // validate() proves the signature; these checks prove authority over
+        // THIS account: either the identity key itself, or (D2) an active
+        // delegated grant bound to the account.
         if signer.to_string() != recipient_spark_pubkey {
-            warn!("signed invoice rejected: signer is not the recipient");
-            return Err(lnurl_error("invalid signature"));
+            let now_secs = i64::try_from(crate::time::now_u64()).unwrap_or_default();
+            let grant = state
+                .db
+                .get_delegated_grant(
+                    &public_recipient.recipient.account_id,
+                    &signer.to_string(),
+                )
+                .await
+                .map_err(|e| {
+                    error!("failed to look up delegated grant: {e:?}");
+                    lnurl_error("internal server error")
+                })?;
+            match grant.filter(|g| g.active_at(now_secs)) {
+                Some(grant) => {
+                    trace!(
+                        "signed invoice authorized via delegated key (granted by {})",
+                        grant.owner_pubkey
+                    );
+                }
+                None => {
+                    warn!("signed invoice rejected: signer is neither recipient nor active delegate");
+                    return Err(lnurl_error("invalid signature"));
+                }
+            }
         }
 
         let expiry = callback_expiry_for_provider(

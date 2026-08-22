@@ -5,7 +5,7 @@ use axum::{
 };
 use axum_extra::extract::Host;
 use bitcoin::secp256k1::{PublicKey, ecdsa::Signature};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::net::IpAddr;
 use tracing::{debug, error, trace, warn};
 
@@ -16,16 +16,17 @@ use crate::{
     },
     models::{
         ERROR_ENHANCED_MODE_REQUIRED, ERROR_INVALID_MODE, ERROR_MODE_REQUEST_NOT_NEWER,
-        ERROR_MODE_TIMESTAMP_IN_FUTURE, ERROR_RATE_LIMITED, ListMetadataRequest,
-        ListMetadataResponse, RecoverLnurlPayRequest, RecoverLnurlPayResponse,
+        ERROR_MODE_TIMESTAMP_IN_FUTURE, ERROR_RATE_LIMITED, GrantDelegatedKeyRequest,
+        GrantDelegatedKeyResponse, ListMetadataRequest, ListMetadataResponse,
+        RecoverLnurlPayRequest, RecoverLnurlPayResponse, RevokeDelegatedKeyParams,
         RegisterLnurlPayRequest, RegisterLnurlPayResponse, SetLnurlPayModeRequest,
         SetLnurlPayModeResponse, TransferLnurlPayRequest, TransferLnurlPayResponse,
         UnregisterLnurlPayRequest, sanitize_username,
     },
     repository::{
         AccountIdentifierKind, AccountMode, AccountProvider, IdentifierTransfer, LnurlRepository,
-        LnurlRepositoryError, NewAccountIdentifier, NewSparkRegistration, ResolvedRecipient,
-        SparkModeUpdate, WalletKind,
+        LnurlRepositoryError, NewAccountIdentifier, NewDelegatedGrant, NewSparkRegistration,
+        ResolvedRecipient, SparkModeUpdate, WalletKind,
     },
     state::State,
     time::now_u64,
@@ -34,6 +35,13 @@ use crate::{
 use super::{LnurlServer, lnurl_pay::PublicIdentifierIntent, lnurl_pay::PublicRecipient};
 
 const SPARK_PROVIDER_DISABLED_MESSAGE: &str = "Spark provider disabled";
+
+fn internal_error() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(Value::String("internal server error".into())),
+    )
+}
 
 // Bounds how far ahead of the stored anchor an accepted mode request can sit,
 // which bounds the cross-device lockout after a fast-clock request.
@@ -338,6 +346,157 @@ where
         Ok(Json(SetLnurlPayModeResponse {
             mode: mode.as_str().to_string(),
         }))
+    }
+
+    /// D2 (blink-wip#1158): authorize an auxiliary secp256k1 key to request
+    /// invoices on this account's behalf. The owner signs
+    /// `"grant:{delegated_pubkey}:{expiry_secs}"`; expiry caps at one year
+    /// and the grant is revocable at any time. Grants confer invoice-request
+    /// authority only — never spend authority.
+    pub async fn grant_delegated_key(
+        Path(pubkey): Path<String>,
+        Extension(state): Extension<State<DB>>,
+        headers: HeaderMap,
+        Json(payload): Json<GrantDelegatedKeyRequest>,
+    ) -> Result<Json<GrantDelegatedKeyResponse>, (StatusCode, Json<Value>)> {
+        require_spark_provider_enabled(&state)?;
+
+        let request_ip = client_ip(&headers);
+        if !state.ip_rate_limiter.check(request_ip) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(Value::String(ERROR_RATE_LIMITED.into())),
+            ));
+        }
+
+        let delegated = parse_pubkey(&payload.delegated_pubkey).map_err(|_| {
+            trace!("grant: invalid delegated pubkey");
+            (StatusCode::BAD_REQUEST, Json(Value::String("invalid pubkey".into())))
+        })?;
+        if delegated.to_string() == parse_pubkey(&pubkey).map_err(|_| {
+            (StatusCode::BAD_REQUEST, Json(Value::String("invalid pubkey".into())))
+        })?.to_string() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(Value::String("cannot delegate to the identity key".into())),
+            ));
+        }
+
+        const MAX_GRANT_EXPIRY_SECS: u64 = 365 * 24 * 3600;
+        let now = now_u64();
+        if payload.expiry_secs == 0 || payload.expiry_secs > MAX_GRANT_EXPIRY_SECS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(Value::String("invalid expiry".into())),
+            ));
+        }
+
+        let message = format!("grant:{}:{}", payload.delegated_pubkey, payload.expiry_secs);
+        let owner = validate(
+            &pubkey,
+            &payload.signature,
+            &message,
+            payload.timestamp,
+            &state,
+        )
+        .await?;
+
+        // The granting key must belong to a registered Spark account.
+        let account = state
+            .db
+            .get_account_by_spark_pubkey(&owner.to_string())
+            .await
+            .map_err(|_| internal_error())?;
+        let Some(account) = account else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(Value::String(String::new())),
+            ));
+        };
+        if account.provider != AccountProvider::Spark {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(Value::String(SPARK_PROVIDER_DISABLED_MESSAGE.into())),
+            ));
+        }
+
+        let expires_at = i64::try_from(now.saturating_add(payload.expiry_secs))
+            .map_err(|_| internal_error())?;
+        let grant = state
+            .db
+            .upsert_delegated_grant(&NewDelegatedGrant {
+                delegated_pubkey: delegated.to_string(),
+                account_id: account.account_id.clone(),
+                owner_pubkey: owner.to_string(),
+                created_at: i64::try_from(now).unwrap_or_default(),
+                expires_at,
+            })
+            .await
+            .map_err(|e| {
+                error!("failed to store delegated grant: {e:?}");
+                internal_error()
+            })?;
+
+        debug!(
+            "granted invoice authority for account {} to {} until {}",
+            grant.account_id, grant.delegated_pubkey, grant.expires_at
+        );
+        Ok(Json(GrantDelegatedKeyResponse {
+            delegated_pubkey: grant.delegated_pubkey,
+            expires_at: grant.expires_at,
+        }))
+    }
+
+    /// D2: revoke a previously granted auxiliary key. The owner signs
+    /// `"revoke:{delegated_pubkey}"`.
+    pub async fn revoke_delegated_key(
+        Path((pubkey, delegated_pubkey)): Path<(String, String)>,
+        Extension(state): Extension<State<DB>>,
+        headers: HeaderMap,
+        Query(params): Query<RevokeDelegatedKeyParams>,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        require_spark_provider_enabled(&state)?;
+
+        let request_ip = client_ip(&headers);
+        if !state.ip_rate_limiter.check(request_ip) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(Value::String(ERROR_RATE_LIMITED.into())),
+            ));
+        }
+        if parse_pubkey(&delegated_pubkey).is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(Value::String("invalid pubkey".into())),
+            ));
+        }
+
+        let message = format!("revoke:{delegated_pubkey}");
+        let owner = validate(
+            &pubkey,
+            &params.signature,
+            &message,
+            params.timestamp,
+            &state,
+        )
+        .await?;
+
+        let now = now_u64();
+        let revoked = state
+            .db
+            .revoke_delegated_grant(
+                &owner.to_string(),
+                &delegated_pubkey,
+                i64::try_from(now).unwrap_or_default(),
+            )
+            .await
+            .map_err(|e| {
+                error!("failed to revoke delegated grant: {e:?}");
+                internal_error()
+            })?;
+
+        debug!("revoked delegated key {delegated_pubkey}: found={revoked}");
+        Ok(Json(json!({ "revoked": revoked })))
     }
 
     pub async fn list_metadata(
@@ -866,7 +1025,7 @@ mod tests {
     use crate::invoice_paid::create_provider_invoice_for_account;
     use crate::routes::test_support::*;
     use lightning_invoice::Bolt11Invoice;
-    use serde_json::Value;
+use serde_json::{Value, json};
     use std::str::FromStr;
 
     fn assert_spark_provider_disabled(result: Result<impl Sized, (StatusCode, Json<Value>)>) {
