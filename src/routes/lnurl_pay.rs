@@ -22,13 +22,14 @@ use std::{
 use tracing::{debug, error, trace, warn};
 
 use crate::{
+    country::client_ip,
     invoice_paid::{
         HandleInvoicePaidError, create_provider_invoice_for_account, handle_invoice_paid,
         handle_invoices_paid,
     },
     models::{
-        CheckUsernameAvailableResponse, ERROR_RECIPIENT_NOT_RECEIVING, InvoicePaidRequest,
-        InvoicesPaidRequest, SignedInvoiceRequest,
+        CheckUsernameAvailableResponse, ERROR_RATE_LIMITED, ERROR_RECIPIENT_NOT_RECEIVING,
+        InvoicePaidRequest, InvoicesPaidRequest, SignedInvoiceRequest,
     },
     providers::{CreateInvoiceRequest, ProviderError},
     repository::{
@@ -603,10 +604,21 @@ where
         Host(host): Host,
         Path(identifier): Path<String>,
         Extension(state): Extension<State<DB>>,
+        headers: axum::http::HeaderMap,
         Json(payload): Json<SignedInvoiceRequest>,
     ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         if identifier.is_empty() {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        }
+
+        // Signature-gated, but still bound per client IP: a valid owner
+        // should not be able to flood the invoice store unthrottled.
+        let request_ip = client_ip(&headers);
+        if !state.ip_rate_limiter.check(request_ip) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(Value::String(ERROR_RATE_LIMITED.into())),
+            ));
         }
 
         let domain = account::sanitize_domain(&state, &host).await?;
