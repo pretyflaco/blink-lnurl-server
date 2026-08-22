@@ -945,7 +945,8 @@ pub(super) fn spark_transfer_error(
         | LnurlRepositoryError::InvalidOwnership
         | LnurlRepositoryError::InvalidProvider
         | LnurlRepositoryError::InvalidIdentifierKind
-        | LnurlRepositoryError::InvalidAccountMode => {
+        | LnurlRepositoryError::InvalidAccountMode
+        | LnurlRepositoryError::DelegatedGrantConflict => {
             error!("unexpected provider-neutral transfer error: {error}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
