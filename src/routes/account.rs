@@ -5,7 +5,7 @@ use axum::{
 };
 use axum_extra::extract::Host;
 use bitcoin::secp256k1::{PublicKey, ecdsa::Signature};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::IpAddr;
 use tracing::{debug, error, trace, warn};
 
@@ -18,8 +18,8 @@ use crate::{
         ERROR_ENHANCED_MODE_REQUIRED, ERROR_INVALID_MODE, ERROR_MODE_REQUEST_NOT_NEWER,
         ERROR_MODE_TIMESTAMP_IN_FUTURE, ERROR_RATE_LIMITED, GrantDelegatedKeyRequest,
         GrantDelegatedKeyResponse, ListMetadataRequest, ListMetadataResponse,
-        RecoverLnurlPayRequest, RecoverLnurlPayResponse, RevokeDelegatedKeyParams,
-        RegisterLnurlPayRequest, RegisterLnurlPayResponse, SetLnurlPayModeRequest,
+        RecoverLnurlPayRequest, RecoverLnurlPayResponse, RegisterLnurlPayRequest,
+        RegisterLnurlPayResponse, RevokeDelegatedKeyParams, SetLnurlPayModeRequest,
         SetLnurlPayModeResponse, TransferLnurlPayRequest, TransferLnurlPayResponse,
         UnregisterLnurlPayRequest, sanitize_username,
     },
@@ -371,11 +371,21 @@ where
 
         let delegated = parse_pubkey(&payload.delegated_pubkey).map_err(|_| {
             trace!("grant: invalid delegated pubkey");
-            (StatusCode::BAD_REQUEST, Json(Value::String("invalid pubkey".into())))
+            (
+                StatusCode::BAD_REQUEST,
+                Json(Value::String("invalid pubkey".into())),
+            )
         })?;
-        if delegated.to_string() == parse_pubkey(&pubkey).map_err(|_| {
-            (StatusCode::BAD_REQUEST, Json(Value::String("invalid pubkey".into())))
-        })?.to_string() {
+        if delegated.to_string()
+            == parse_pubkey(&pubkey)
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(Value::String("invalid pubkey".into())),
+                    )
+                })?
+                .to_string()
+        {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(Value::String("cannot delegate to the identity key".into())),
@@ -408,10 +418,7 @@ where
             .await
             .map_err(|_| internal_error())?;
         let Some(account) = account else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(Value::String(String::new())),
-            ));
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
         if account.provider != AccountProvider::Spark {
             return Err((
@@ -420,8 +427,8 @@ where
             ));
         }
 
-        let expires_at = i64::try_from(now.saturating_add(payload.expiry_secs))
-            .map_err(|_| internal_error())?;
+        let expires_at =
+            i64::try_from(now.saturating_add(payload.expiry_secs)).map_err(|_| internal_error())?;
         let grant = state
             .db
             .upsert_delegated_grant(&NewDelegatedGrant {
@@ -1038,7 +1045,7 @@ mod tests {
     use crate::invoice_paid::create_provider_invoice_for_account;
     use crate::routes::test_support::*;
     use lightning_invoice::Bolt11Invoice;
-use serde_json::{Value, json};
+    use serde_json::{Value, json};
     use std::str::FromStr;
 
     fn assert_spark_provider_disabled(result: Result<impl Sized, (StatusCode, Json<Value>)>) {

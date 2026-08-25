@@ -160,7 +160,12 @@ impl LnurlRepository for MockRepository {
         &self,
         grant: &crate::repository::NewDelegatedGrant,
     ) -> Result<crate::repository::DelegatedGrant, LnurlRepositoryError> {
-        if let Some(existing) = self.delegated_grants.lock().unwrap().get(&grant.delegated_pubkey) {
+        if let Some(existing) = self
+            .delegated_grants
+            .lock()
+            .unwrap()
+            .get(&grant.delegated_pubkey)
+        {
             if existing.owner_pubkey != grant.owner_pubkey {
                 return Err(LnurlRepositoryError::DelegatedGrantConflict);
             }
@@ -188,9 +193,7 @@ impl LnurlRepository for MockRepository {
     ) -> Result<bool, LnurlRepositoryError> {
         let mut grants = self.delegated_grants.lock().unwrap();
         match grants.get_mut(delegated_pubkey) {
-            Some(g)
-                if g.owner_pubkey == owner_pubkey && g.revoked_at.is_none() =>
-            {
+            Some(g) if g.owner_pubkey == owner_pubkey && g.revoked_at.is_none() => {
                 g.revoked_at = Some(revoked_at_secs);
                 Ok(true)
             }
