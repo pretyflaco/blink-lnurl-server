@@ -139,6 +139,26 @@ fn claim_signed_invoice_request_id(key: &str) -> bool {
     true
 }
 
+/// D1 canonical message. Every parameter that influences minting is bound.
+/// `expiry_secs` encodes `None` distinctly from `Some(0)`: both previously
+/// rendered as `0`, which would let a captured signature cover a request
+/// whose expiry semantics differ from what the signer committed to.
+fn canonical_signed_invoice_message(
+    domain: &str,
+    identifier: &str,
+    amount_msat: u64,
+    description_hash: &str,
+    expiry_secs: Option<u32>,
+    request_id: &str,
+) -> String {
+    let expiry_tag = expiry_secs
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "lnurl-invoice-v1:{domain}:{identifier}:{amount_msat}:{description_hash}:{expiry_tag}:{request_id}"
+    )
+}
+
 /// D1 description hashes must be exactly 64 lowercase hex chars; anything
 /// else is either malformed or an attempt to smuggle non-canonical forms.
 fn parse_signed_description_hash(hex_str: &str) -> Option<[u8; 32]> {
@@ -668,10 +688,13 @@ where
             return Err(lnurl_error("invalid request id"));
         }
 
-        let expiry_secs_tag = payload.expiry_secs.unwrap_or(0);
-        let canonical = format!(
-            "lnurl-invoice-v1:{domain}:{identifier}:{}:{}:{expiry_secs_tag}:{}",
-            payload.amount_msat, payload.description_hash, payload.request_id
+        let canonical = canonical_signed_invoice_message(
+            &domain,
+            &identifier,
+            payload.amount_msat,
+            &payload.description_hash,
+            payload.expiry_secs,
+            &payload.request_id,
         );
         let signer = account::validate(
             &payload.pubkey,
@@ -682,10 +705,39 @@ where
         )
         .await?;
 
-        // validate() proves the signature; this check proves ownership of
-        // THIS account.
-        if signer.to_string() != recipient_spark_pubkey {
-            warn!("signed invoice rejected: signer is not the recipient");
+        // validate() proves the signature; these checks prove authority over
+        // THIS account: either the identity key itself, or (D2) an active
+        // delegated grant bound to the account.
+        let authorized = if signer.to_string() == recipient_spark_pubkey {
+            true
+        } else {
+            let now_secs = i64::try_from(crate::time::now_u64()).unwrap_or_default();
+            let grant = state
+                .db
+                .get_delegated_grant(
+                    &public_recipient.recipient.account_id,
+                    &signer.to_string(),
+                )
+                .await
+                .map_err(|e| {
+                    error!("failed to look up delegated grant: {e:?}");
+                    lnurl_error("internal server error")
+                })?;
+            match grant.filter(|g| g.active_at(now_secs)) {
+                Some(grant) => {
+                    trace!(
+                        "signed invoice authorized via delegated key (granted by {})",
+                        grant.owner_pubkey
+                    );
+                    true
+                }
+                None => {
+                    warn!("signed invoice rejected: signer is neither recipient nor active delegate");
+                    false
+                }
+            }
+        };
+        if !authorized {
             return Err(lnurl_error("invalid signature"));
         }
 
@@ -693,10 +745,7 @@ where
         // garbage cannot burn legitimate request ids.
         let replay_key = format!("{recipient_spark_pubkey}:{}", payload.request_id);
         if !claim_signed_invoice_request_id(&replay_key) {
-            warn!(
-                "signed invoice replay rejected for request_id '{}'",
-                payload.request_id
-            );
+            warn!("signed invoice replay rejected for request_id '{}'", payload.request_id);
             return Err(lnurl_error("request id already used"));
         }
 
@@ -1188,6 +1237,102 @@ mod tests {
             .unwrap()
             .as_nanos();
         format!("{n}")
+    }
+
+    #[test]
+    fn canonical_message_binds_every_mint_parameter() {
+        let base = canonical_signed_invoice_message(
+            "example.com",
+            "alice",
+            21_000,
+            &"a".repeat(64),
+            Some(3600),
+            "req1",
+        );
+        assert_eq!(
+            base,
+            format!(
+                "lnurl-invoice-v1:example.com:alice:21000:{}:3600:req1",
+                "a".repeat(64)
+            )
+        );
+        // every parameter moves the canonical string
+        for other in [
+            canonical_signed_invoice_message(
+                "other.com",
+                "alice",
+                21_000,
+                &"a".repeat(64),
+                Some(3600),
+                "req1",
+            ),
+            canonical_signed_invoice_message(
+                "example.com",
+                "bob",
+                21_000,
+                &"a".repeat(64),
+                Some(3600),
+                "req1",
+            ),
+            canonical_signed_invoice_message(
+                "example.com",
+                "alice",
+                22_000,
+                &"a".repeat(64),
+                Some(3600),
+                "req1",
+            ),
+            canonical_signed_invoice_message(
+                "example.com",
+                "alice",
+                21_000,
+                &"b".repeat(64),
+                Some(3600),
+                "req1",
+            ),
+            canonical_signed_invoice_message(
+                "example.com",
+                "alice",
+                21_000,
+                &"a".repeat(64),
+                Some(3601),
+                "req1",
+            ),
+            canonical_signed_invoice_message(
+                "example.com",
+                "alice",
+                21_000,
+                &"a".repeat(64),
+                Some(3600),
+                "req2",
+            ),
+        ] {
+            assert_ne!(base, other);
+        }
+    }
+
+    #[test]
+    fn canonical_message_distinguishes_absent_expiry_from_zero() {
+        let absent = canonical_signed_invoice_message(
+            "example.com",
+            "alice",
+            21_000,
+            &"a".repeat(64),
+            None,
+            "req1",
+        );
+        let zero = canonical_signed_invoice_message(
+            "example.com",
+            "alice",
+            21_000,
+            &"a".repeat(64),
+            Some(0),
+            "req1",
+        );
+        assert_ne!(
+            absent, zero,
+            "absent expiry must not alias an explicit 0 in the signed message"
+        );
     }
 
     // -- Public LNURL provider-dispatch compatibility -------------------------

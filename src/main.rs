@@ -614,10 +614,17 @@ where
             post(LnurlServer::<DB>::transfer),
         )
         .route(
-            "/lnurlpay/{pubkey}/recover",
-            post(LnurlServer::<DB>::recover),
+            "/lnurlpay/{pubkey}/mode",
+            post(LnurlServer::<DB>::set_mode),
         )
-        .route("/lnurlpay/{pubkey}/mode", post(LnurlServer::<DB>::set_mode))
+        .route(
+            "/lnurlpay/{pubkey}/grant",
+            post(LnurlServer::<DB>::grant_delegated_key),
+        )
+        .route(
+            "/lnurlpay/{pubkey}/grant/{delegated_pubkey}",
+            delete(LnurlServer::<DB>::revoke_delegated_key),
+        )
         .route(
             "/lnurlpay/{pubkey}/metadata",
             get(LnurlServer::<DB>::list_metadata),
