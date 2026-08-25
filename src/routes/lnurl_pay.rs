@@ -13,17 +13,23 @@ use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
 use nostr::{Event, JsonUtil};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::str::FromStr;
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{LazyLock, Mutex},
+    time::{Duration, Instant},
+};
 use tracing::{debug, error, trace, warn};
 
 use crate::{
+    country::client_ip,
     invoice_paid::{
         HandleInvoicePaidError, create_provider_invoice_for_account, handle_invoice_paid,
         handle_invoices_paid,
     },
     models::{
-        CheckUsernameAvailableResponse, ERROR_RECIPIENT_NOT_RECEIVING, InvoicePaidRequest,
-        InvoicesPaidRequest,
+        CheckUsernameAvailableResponse, ERROR_RATE_LIMITED, ERROR_RECIPIENT_NOT_RECEIVING,
+        InvoicePaidRequest, InvoicesPaidRequest, SignedInvoiceRequest,
     },
     providers::{CreateInvoiceRequest, ProviderError},
     repository::{
@@ -106,6 +112,51 @@ pub(super) struct PublicRecipient {
 }
 
 const BLINK_USD_MIN_SENDABLE_FALLBACK_MSAT: u64 = 50_000;
+
+/// D1 replay protection: `{pubkey}:{request_id}` -> first-seen instant.
+///
+/// In-memory by design for v1 (blink-wip#1158 open decision #2): signatures
+/// are only valid while their timestamp is fresh, so a server restart cannot
+/// widen the replay window beyond `ACCEPTABLE_TIME_DIFF_SECS`. Upgrade path
+/// is a durable request-id table without changing callers.
+const SIGNED_INVOICE_REPLAY_TTL: Duration = Duration::from_secs(900);
+
+static SIGNED_INVOICE_REPLAY: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Returns false when the key was already claimed inside the TTL window;
+/// atomically claims it otherwise and opportunistically prunes expired keys.
+fn claim_signed_invoice_request_id(key: &str) -> bool {
+    let mut map = SIGNED_INVOICE_REPLAY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    map.retain(|_, seen| now.duration_since(*seen) < SIGNED_INVOICE_REPLAY_TTL);
+    if map.contains_key(key) {
+        return false;
+    }
+    map.insert(key.to_string(), now);
+    true
+}
+
+/// D1 description hashes must be exactly 64 lowercase hex chars; anything
+/// else is either malformed or an attempt to smuggle non-canonical forms.
+fn parse_signed_description_hash(hex_str: &str) -> Option<[u8; 32]> {
+    if hex_str.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        // to_digit(16) accepts uppercase too; reject those explicitly
+        if chunk[0].is_ascii_uppercase() || chunk[1].is_ascii_uppercase() {
+            return None;
+        }
+        out[i] = hi as u8 * 16 + lo as u8;
+    }
+    Some(out)
+}
 
 fn public_recipient_wallet(public_recipient: &PublicRecipient) -> Option<WalletKind> {
     public_recipient
@@ -539,6 +590,219 @@ where
         })))
     }
 
+    /// D1: Spark-signed invoice creation with a caller-chosen description
+    /// hash (blink-wip#1158). The canonical message binds every parameter:
+    ///
+    /// `lnurl-invoice-v1:{domain}:{identifier}:{amount_msat}:{description_hash}:{expiry_secs}:{request_id}`
+    ///
+    /// signed over `"{canonical}-{timestamp}"` by the recipient's own Spark
+    /// identity key (same scheme as `account::validate` for registration).
+    /// Only the hash is accepted — never metadata, descriptions or nostr
+    /// events — so the caller keeps its LNURLp metadata locally while payers
+    /// verify the invoice against it.
+    pub async fn handle_signed_invoice(
+        Host(host): Host,
+        Path(identifier): Path<String>,
+        Extension(state): Extension<State<DB>>,
+        headers: axum::http::HeaderMap,
+        Json(payload): Json<SignedInvoiceRequest>,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        if identifier.is_empty() {
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        }
+
+        // Signature-gated, but still bound per client IP: a valid owner
+        // should not be able to flood the invoice store unthrottled.
+        let request_ip = client_ip(&headers);
+        if !state.ip_rate_limiter.check(request_ip) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(Value::String(ERROR_RATE_LIMITED.into())),
+            ));
+        }
+
+        let domain = account::sanitize_domain(&state, &host).await?;
+
+        let Some(public_identifier) =
+            account::parse_public_identifier_for_public_route(&identifier).map_err(|e| {
+                trace!("invalid public identifier '{identifier}': {e:?}");
+                lnurl_error("invalid identifier")
+            })?
+        else {
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        };
+        let public_recipient =
+            account::resolve_public_recipient(&state, &domain, public_identifier).await?;
+        let Some(public_recipient) = public_recipient else {
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        };
+
+        // Authorization rides on Spark identity-key signatures, so only
+        // Spark accounts can use this endpoint.
+        if public_recipient.recipient.provider != AccountProvider::Spark {
+            trace!("signed invoice refused for non-spark recipient");
+            return Err(lnurl_error("invalid identifier"));
+        }
+        let Some(recipient_spark_pubkey) = public_recipient.recipient.spark_pubkey.as_deref()
+        else {
+            trace!("signed invoice refused: spark recipient without pubkey");
+            return Err(lnurl_error("internal server error"));
+        };
+
+        let Some(desc_hash) = parse_signed_description_hash(&payload.description_hash) else {
+            trace!("signed invoice refused: malformed description hash");
+            return Err(lnurl_error("invalid description hash"));
+        };
+
+        if payload.amount_msat == 0
+            || payload.amount_msat % 1000 != 0
+            || payload.amount_msat < state.min_sendable
+            || payload.amount_msat > state.max_sendable
+        {
+            trace!("signed invoice amount out of range: {}", payload.amount_msat);
+            return Err(lnurl_error("amount out of range"));
+        }
+
+        if payload.request_id.is_empty() || payload.request_id.len() > 128 {
+            trace!("signed invoice refused: bad request id length");
+            return Err(lnurl_error("invalid request id"));
+        }
+
+        let expiry_secs_tag = payload.expiry_secs.unwrap_or(0);
+        let canonical = format!(
+            "lnurl-invoice-v1:{domain}:{identifier}:{}:{}:{expiry_secs_tag}:{}",
+            payload.amount_msat, payload.description_hash, payload.request_id
+        );
+        let signer = account::validate(
+            &payload.pubkey,
+            &payload.signature,
+            &canonical,
+            payload.timestamp,
+            &state,
+        )
+        .await?;
+
+        // validate() proves the signature; this check proves ownership of
+        // THIS account.
+        if signer.to_string() != recipient_spark_pubkey {
+            warn!("signed invoice rejected: signer is not the recipient");
+            return Err(lnurl_error("invalid signature"));
+        }
+
+        // Replay guard runs only after authorization so unauthenticated
+        // garbage cannot burn legitimate request ids.
+        let replay_key = format!("{recipient_spark_pubkey}:{}", payload.request_id);
+        if !claim_signed_invoice_request_id(&replay_key) {
+            warn!(
+                "signed invoice replay rejected for request_id '{}'",
+                payload.request_id
+            );
+            return Err(lnurl_error("request id already used"));
+        }
+
+        let expiry = callback_expiry_for_provider(
+            public_recipient.recipient.provider,
+            public_recipient.wallet,
+            public_recipient.recipient.default_wallet,
+            payload.expiry_secs,
+        )?;
+
+        let min_sendable = resolve_min_sendable_msat(&state, &public_recipient).await;
+        if payload.amount_msat < min_sendable {
+            trace!("signed invoice amount below resolved minSendable");
+            return Err(lnurl_error("amount out of range"));
+        }
+
+        let desc_hash = sha256::Hash::from_byte_array(desc_hash);
+
+        let res = state
+            .providers
+            .create_invoice(CreateInvoiceRequest {
+                recipient: &public_recipient.recipient,
+                wallet: public_recipient.wallet,
+                amount_sat: payload.amount_msat / 1000,
+                description_hash: desc_hash.to_byte_array(),
+                expiry,
+                include_spark_address: state.include_spark_address,
+            })
+            .await
+            .map_err(map_provider_invoice_error)?;
+
+        debug!("Created signed-request lightning invoice: {:?}", res);
+
+        let invoice = Bolt11Invoice::from_str(&res.bolt11).map_err(|e| {
+            error!("failed to parse invoice: {}", e);
+            lnurl_error("internal server error")
+        })?;
+
+        if !matches!(invoice.description(), Bolt11InvoiceDescriptionRef::Hash(hash) if hash.0.to_string() == desc_hash.to_string())
+        {
+            error!("provider returned invoice with unexpected description hash");
+            return Err(lnurl_error("internal server error"));
+        }
+
+        let Some(invoice_amount_msat) = invoice.amount_milli_satoshis() else {
+            error!("provider returned invoice without an amount");
+            return Err(lnurl_error("internal server error"));
+        };
+        if invoice_amount_msat != payload.amount_msat {
+            error!(
+                "provider returned invoice amount {} msat, expected {} msat",
+                invoice_amount_msat, payload.amount_msat
+            );
+            return Err(lnurl_error("internal server error"));
+        }
+
+        let expiry_timestamp = invoice.expires_at().ok_or_else(|| {
+            error!(
+                "invoice has invalid expiry: duration since epoch {}s, expiry time: {}s",
+                invoice.duration_since_epoch().as_secs(),
+                invoice.expiry_time().as_secs()
+            );
+            lnurl_error("internal server error")
+        })?;
+
+        let payment_hash = invoice.payment_hash().to_string();
+        let invoice_expiry: i64 = i64::try_from(expiry_timestamp.as_secs()).map_err(|e| {
+            error!(
+                "invoice has invalid expiry for i64: {e}",
+            );
+            lnurl_error("internal server error")
+        })?;
+
+        let account_id = public_recipient.recipient.account_id.clone();
+        let legacy_user_pubkey = recipient_spark_pubkey.to_string();
+
+        // Store invoice for LUD-21 verify support and webhook delivery —
+        // identical to the public route so verification behaves the same.
+        if let Err(e) = create_provider_invoice_for_account(
+            &state.db,
+            &payment_hash,
+            Some(&account_id),
+            Some(public_recipient.recipient.provider),
+            Some(res.wallet_kind),
+            res.wallet_id.as_deref(),
+            res.provider_payment_hash.as_deref(),
+            &legacy_user_pubkey,
+            &res.bolt11,
+            invoice_expiry,
+            &domain,
+        )
+        .await
+        {
+            error!("Failed to create invoice record: {}", e);
+            return Err(lnurl_error("internal server error"));
+        }
+
+        let verify_url = build_verify_url(&state, &domain, &payment_hash);
+
+        Ok(Json(json!({
+            "pr": res.bolt11,
+            "routes": Vec::<String>::new(),
+            "verify": verify_url,
+        })))
+    }
+
     /// LUD-21 verify endpoint
     pub async fn verify(
         Path(payment_hash): Path<String>,
@@ -848,6 +1112,84 @@ mod tests {
     use super::*;
     use crate::routes::test_support::*;
     use serde_json::{Value, json};
+
+    // -- D1 signed-invoice helpers (blink-wip#1158) --------------------------
+    // The full authorize+mint path is covered by live E2E (see the LNbits dev
+    // box); the Spark provider mints via the SSP over the network so it is not
+    // reproducible offline. These cover the deterministic building blocks.
+
+    #[test]
+    fn signed_description_hash_accepts_only_64_lowercase_hex() {
+        let valid = "a".repeat(64);
+        assert!(parse_signed_description_hash(&valid).is_some());
+        let mixed = format!("{}{}", "0123456789abcdef".repeat(3), "0123456789abcdef");
+        assert!(parse_signed_description_hash(&mixed).is_some());
+
+        // too short / too long
+        assert!(parse_signed_description_hash(&"a".repeat(63)).is_none());
+        assert!(parse_signed_description_hash(&"a".repeat(65)).is_none());
+        // uppercase rejected (canonical form only)
+        assert!(parse_signed_description_hash(&"A".repeat(64)).is_none());
+        // non-hex rejected
+        assert!(parse_signed_description_hash(&"g".repeat(64)).is_none());
+    }
+
+    #[test]
+    fn signed_description_hash_bytes_roundtrip() {
+        let hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let bytes = parse_signed_description_hash(hex).expect("valid hash");
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[1], 0x11);
+        assert_eq!(bytes[31], 0xff);
+    }
+
+    #[test]
+    fn signed_invoice_replay_id_claimed_once() {
+        let key = format!("pk:{}", uuid_like());
+        assert!(claim_signed_invoice_request_id(&key), "first claim succeeds");
+        assert!(
+            !claim_signed_invoice_request_id(&key),
+            "second claim of same key is rejected"
+        );
+        // a different key is independent
+        let other = format!("pk:{}", uuid_like());
+        assert!(claim_signed_invoice_request_id(&other));
+    }
+
+    #[test]
+    fn signed_invoice_request_rejects_unknown_fields() {
+        let base = json!({
+            "amount_msat": 1000u64,
+            "description_hash": "a".repeat(64),
+            "request_id": "abc",
+            "pubkey": "02aa",
+            "timestamp": 1_700_000_000u64,
+            "signature": "3044",
+        });
+        // clean request deserializes
+        assert!(serde_json::from_value::<SignedInvoiceRequest>(base.clone()).is_ok());
+
+        // smuggling metadata/description/nostr must fail (deny_unknown_fields)
+        for field in ["metadata", "description", "nostr"] {
+            let mut bad = base.clone();
+            bad[field] = json!("evil");
+            assert!(
+                serde_json::from_value::<SignedInvoiceRequest>(bad).is_err(),
+                "field '{field}' must be rejected"
+            );
+        }
+    }
+
+    // small non-crypto unique string generator for replay-key tests
+    fn uuid_like() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{n}")
+    }
+
     // -- Public LNURL provider-dispatch compatibility -------------------------
 
     #[test]

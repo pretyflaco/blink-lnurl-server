@@ -654,6 +654,10 @@ where
             "/lnurlp/{identifier}/invoice",
             get(LnurlServer::<DB>::handle_invoice),
         )
+        .route(
+            "/lnurlp/{identifier}/invoice/signed",
+            post(LnurlServer::<DB>::handle_signed_invoice),
+        )
         .route("/verify/{payment_hash}", get(LnurlServer::<DB>::verify))
         .route("/webhook", post(LnurlServer::<DB>::webhook))
         .route("/webhook/blink", post(LnurlServer::<DB>::blink_webhook))
