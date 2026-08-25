@@ -614,6 +614,10 @@ where
             post(LnurlServer::<DB>::transfer),
         )
         .route(
+            "/lnurlpay/{pubkey}/recover",
+            post(LnurlServer::<DB>::recover),
+        )
+        .route(
             "/lnurlpay/{pubkey}/mode",
             post(LnurlServer::<DB>::set_mode),
         )

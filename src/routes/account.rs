@@ -359,6 +359,8 @@ where
         headers: HeaderMap,
         Json(payload): Json<GrantDelegatedKeyRequest>,
     ) -> Result<Json<GrantDelegatedKeyResponse>, (StatusCode, Json<Value>)> {
+        const MAX_GRANT_EXPIRY_SECS: u64 = 365 * 24 * 3600;
+
         require_spark_provider_enabled(&state)?;
 
         let request_ip = client_ip(&headers);
@@ -382,7 +384,6 @@ where
             ));
         }
 
-        const MAX_GRANT_EXPIRY_SECS: u64 = 365 * 24 * 3600;
         let now = now_u64();
         if payload.expiry_secs == 0 || payload.expiry_secs > MAX_GRANT_EXPIRY_SECS {
             return Err((
