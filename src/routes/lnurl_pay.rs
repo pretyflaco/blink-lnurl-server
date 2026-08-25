@@ -119,7 +119,7 @@ const BLINK_USD_MIN_SENDABLE_FALLBACK_MSAT: u64 = 50_000;
 /// are only valid while their timestamp is fresh, so a server restart cannot
 /// widen the replay window beyond `ACCEPTABLE_TIME_DIFF_SECS`. Upgrade path
 /// is a durable request-id table without changing callers.
-const SIGNED_INVOICE_REPLAY_TTL: Duration = Duration::from_secs(900);
+const SIGNED_INVOICE_REPLAY_TTL: Duration = Duration::from_mins(15);
 
 static SIGNED_INVOICE_REPLAY: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -151,9 +151,7 @@ fn canonical_signed_invoice_message(
     expiry_secs: Option<u32>,
     request_id: &str,
 ) -> String {
-    let expiry_tag = expiry_secs
-        .map(|e| e.to_string())
-        .unwrap_or_else(|| "none".to_string());
+    let expiry_tag = expiry_secs.map_or_else(|| "none".to_string(), |e| e.to_string());
     format!(
         "lnurl-invoice-v1:{domain}:{identifier}:{amount_msat}:{description_hash}:{expiry_tag}:{request_id}"
     )
@@ -173,7 +171,9 @@ fn parse_signed_description_hash(hex_str: &str) -> Option<[u8; 32]> {
         if chunk[0].is_ascii_uppercase() || chunk[1].is_ascii_uppercase() {
             return None;
         }
-        out[i] = hi as u8 * 16 + lo as u8;
+        let hi = u8::try_from(hi).ok()?;
+        let lo = u8::try_from(lo).ok()?;
+        out[i] = hi.checked_mul(16)?.checked_add(lo)?;
     }
     Some(out)
 }
@@ -618,8 +618,12 @@ where
     /// signed over `"{canonical}-{timestamp}"` by the recipient's own Spark
     /// identity key (same scheme as `account::validate` for registration).
     /// Only the hash is accepted — never metadata, descriptions or nostr
-    /// events — so the caller keeps its LNURLp metadata locally while payers
+    /// events — so the caller keeps its `LNURLp` metadata locally while payers
     /// verify the invoice against it.
+    // Route handler: the D1 request needs staged validation + authorization +
+    // minting in one place; splitting it purely for the lint would hurt
+    // readability without changing behavior.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_signed_invoice(
         Host(host): Host,
         Path(identifier): Path<String>,
@@ -723,20 +727,15 @@ where
                     error!("failed to look up delegated grant: {e:?}");
                     lnurl_error("internal server error")
                 })?;
-            match grant.filter(|g| g.active_at(now_secs)) {
-                Some(grant) => {
-                    trace!(
-                        "signed invoice authorized via delegated key (granted by {})",
-                        grant.owner_pubkey
-                    );
-                    true
-                }
-                None => {
-                    warn!(
-                        "signed invoice rejected: signer is neither recipient nor active delegate"
-                    );
-                    false
-                }
+            if let Some(grant) = grant.filter(|g| g.active_at(now_secs)) {
+                trace!(
+                    "signed invoice authorized via delegated key (granted by {})",
+                    grant.owner_pubkey
+                );
+                true
+            } else {
+                warn!("signed invoice rejected: signer is neither recipient nor active delegate");
+                false
             }
         };
         if !authorized {

@@ -165,10 +165,9 @@ impl LnurlRepository for MockRepository {
             .lock()
             .unwrap()
             .get(&grant.delegated_pubkey)
+            && existing.owner_pubkey != grant.owner_pubkey
         {
-            if existing.owner_pubkey != grant.owner_pubkey {
-                return Err(LnurlRepositoryError::DelegatedGrantConflict);
-            }
+            return Err(LnurlRepositoryError::DelegatedGrantConflict);
         }
         let record = crate::repository::DelegatedGrant {
             delegated_pubkey: grant.delegated_pubkey.clone(),
