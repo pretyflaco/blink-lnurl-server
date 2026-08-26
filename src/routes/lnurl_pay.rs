@@ -685,7 +685,10 @@ where
             || payload.amount_msat < state.min_sendable
             || payload.amount_msat > state.max_sendable
         {
-            trace!("signed invoice amount out of range: {}", payload.amount_msat);
+            trace!(
+                "signed invoice amount out of range: {}",
+                payload.amount_msat
+            );
             return Err(lnurl_error("amount out of range"));
         }
 
@@ -720,27 +723,21 @@ where
             let now_secs = i64::try_from(crate::time::now_u64()).unwrap_or_default();
             let grant = state
                 .db
-                .get_delegated_grant(
-                    &public_recipient.recipient.account_id,
-                    &signer.to_string(),
-                )
+                .get_delegated_grant(&public_recipient.recipient.account_id, &signer.to_string())
                 .await
                 .map_err(|e| {
                     error!("failed to look up delegated grant: {e:?}");
                     lnurl_error("internal server error")
                 })?;
-            match grant.filter(|g| g.active_at(now_secs)) {
-                Some(grant) => {
-                    trace!(
-                        "signed invoice authorized via delegated key (granted by {})",
-                        grant.owner_pubkey
-                    );
-                    true
-                }
-                None => {
-                    warn!("signed invoice rejected: signer is neither recipient nor active delegate");
-                    false
-                }
+            if let Some(grant) = grant.filter(|g| g.active_at(now_secs)) {
+                trace!(
+                    "signed invoice authorized via delegated key (granted by {})",
+                    grant.owner_pubkey
+                );
+                true
+            } else {
+                warn!("signed invoice rejected: signer is neither recipient nor active delegate");
+                false
             }
         };
         if !authorized {
@@ -751,7 +748,10 @@ where
         // garbage cannot burn legitimate request ids.
         let replay_key = format!("{recipient_spark_pubkey}:{}", payload.request_id);
         if !claim_signed_invoice_request_id(&replay_key) {
-            warn!("signed invoice replay rejected for request_id '{}'", payload.request_id);
+            warn!(
+                "signed invoice replay rejected for request_id '{}'",
+                payload.request_id
+            );
             return Err(lnurl_error("request id already used"));
         }
 
@@ -819,9 +819,7 @@ where
 
         let payment_hash = invoice.payment_hash().to_string();
         let invoice_expiry: i64 = i64::try_from(expiry_timestamp.as_secs()).map_err(|e| {
-            error!(
-                "invoice has invalid expiry for i64: {e}",
-            );
+            error!("invoice has invalid expiry for i64: {e}",);
             lnurl_error("internal server error")
         })?;
 
@@ -1201,7 +1199,10 @@ mod tests {
     #[test]
     fn signed_invoice_replay_id_claimed_once() {
         let key = format!("pk:{}", uuid_like());
-        assert!(claim_signed_invoice_request_id(&key), "first claim succeeds");
+        assert!(
+            claim_signed_invoice_request_id(&key),
+            "first claim succeeds"
+        );
         assert!(
             !claim_signed_invoice_request_id(&key),
             "second claim of same key is rejected"

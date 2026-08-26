@@ -1088,7 +1088,8 @@ impl crate::repository::LnurlRepository for LnurlRepository {
     async fn insert_lnurl_sender_comment(
         &self,
         comment: &LnurlSenderComment,
-    ) -> Result<(), LnurlRepositoryError> {        sqlx::query(
+    ) -> Result<(), LnurlRepositoryError> {
+        sqlx::query(
             "INSERT INTO sender_comments (payment_hash, user_pubkey, sender_comment, updated_at, account_id)
              VALUES ($1, $2, $3, $4, $5)
               ON CONFLICT(payment_hash) DO UPDATE

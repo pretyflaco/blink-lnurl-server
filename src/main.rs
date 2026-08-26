@@ -625,10 +625,7 @@ where
             "/lnurlpay/{pubkey}/recover",
             post(LnurlServer::<DB>::recover),
         )
-        .route(
-            "/lnurlpay/{pubkey}/mode",
-            post(LnurlServer::<DB>::set_mode),
-        )
+        .route("/lnurlpay/{pubkey}/mode", post(LnurlServer::<DB>::set_mode))
         .route(
             "/lnurlpay/{pubkey}/grant",
             post(LnurlServer::<DB>::grant_delegated_key),
