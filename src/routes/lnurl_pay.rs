@@ -393,7 +393,9 @@ where
             let mode = account::stored_account_mode(&state, spark_pubkey)
                 .await
                 .map_err(|_| lnurl_error("internal server error"))?;
-            if mode == Some(AccountMode::Anon) {
+            // Upstream refuses to mint for an Anon recipient (dormant address);
+            // --allow-anon-addresses lifts the dormancy for anon-friendly forks.
+            if !state.allow_anon_addresses && mode == Some(AccountMode::Anon) {
                 trace!("invoice refused for anon-mode recipient");
                 return Err(lnurl_error(ERROR_RECIPIENT_NOT_RECEIVING));
             }
@@ -2462,6 +2464,42 @@ mod tests {
             )
             .await,
             ERROR_RECIPIENT_NOT_RECEIVING,
+        );
+    }
+
+    #[tokio::test]
+    async fn invoice_minting_proceeds_for_an_anon_owner_when_allow_anon_addresses_is_set() {
+        let (repo, mut state) = mode_gate_state(Some(AccountMode::Anon)).await;
+        state.allow_anon_addresses = true;
+
+        // A missing amount is the next check after the gate: seeing it proves the
+        // flag let the request past the anon dormancy without minting anything.
+        assert_lnurl_error(
+            get_public_invoice(state.clone(), "bob", LnurlPayCallbackParams::default()).await,
+            "missing amount",
+        );
+
+        let mut callback_state = state;
+        callback_state.callback_domain = Some("callback.example.com".to_string());
+        assert_lnurl_error(
+            get_public_invoice_for_domain(
+                callback_state,
+                "example.com",
+                "bob",
+                LnurlPayCallbackParams::default(),
+            )
+            .await,
+            "missing amount",
+        );
+        // The mode record is untouched by the lifted gate.
+        let recipient = spark_resolved_recipient();
+        let pubkey = recipient
+            .spark_pubkey
+            .expect("spark recipient has a pubkey");
+        assert_eq!(
+            repo.spark_mode(&pubkey).unwrap().mode,
+            Some(AccountMode::Anon),
+            "minting under the flag must not re-type the account"
         );
     }
 
