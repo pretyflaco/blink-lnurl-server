@@ -76,7 +76,9 @@ where
         let domain = sanitize_domain(&state, &host).await?;
 
         let stored_mode = stored_account_mode(&state, &pubkey.to_string()).await?;
-        if stored_mode == Some(AccountMode::Anon) {
+        // Upstream dormancy: an Anon account holds no registrable address. A deployment
+        // running with --allow-anon-addresses lifts this (fork-only; see Args).
+        if !state.allow_anon_addresses && stored_mode == Some(AccountMode::Anon) {
             return Err(enhanced_mode_required());
         }
 
@@ -140,7 +142,11 @@ where
         let from_pubkey = from_pk.to_string();
         let to_pubkey = to_pk.to_string();
 
-        if stored_account_mode(&state, &to_pubkey).await? == Some(AccountMode::Anon) {
+        // Same dormancy rule as registration, applied to the transfer's target account
+        // (fork: lifted by --allow-anon-addresses).
+        if !state.allow_anon_addresses
+            && stored_account_mode(&state, &to_pubkey).await? == Some(AccountMode::Anon)
+        {
             return Err(enhanced_mode_required());
         }
 
@@ -2182,6 +2188,38 @@ use serde_json::{Value, json};
         assert!(
             untyped_repo.spark_mode(&pubkey).is_none(),
             "register must not type an account"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_is_allowed_while_anon_when_allow_anon_addresses_is_set() {
+        let (secret, pubkey) = mode_key(18);
+        let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Anon));
+        let mut state =
+            route_test_state_with_country_resolver(repo.clone(), CountryResolver::disabled()).await;
+        state.allow_anon_addresses = true;
+        let timestamp = now_u64();
+
+        let request = RegisterLnurlPayRequest {
+            username: "alice".to_string(),
+            signature: sign_hex(&secret, &format!("alice-{timestamp}")),
+            timestamp,
+            description: "Alice".to_string(),
+        };
+        let _ = LnurlServer::register(
+            Host("example.com".to_string()),
+            Path(pubkey.clone()),
+            Extension(state),
+            HeaderMap::new(),
+            Json(request),
+        )
+        .await
+        .expect("the flag lifts the anon registration refusal");
+        assert_eq!(repo.spark_registration_count(), 1);
+        // The privacy property is untouched: registration must not re-type the account.
+        assert_eq!(
+            repo.spark_mode(&pubkey).unwrap().mode,
+            Some(AccountMode::Anon)
         );
     }
 

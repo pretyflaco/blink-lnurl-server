@@ -766,6 +766,8 @@ pub(super) async fn internal_route_test_state_full(
         )),
         scheme: "http".to_string(),
         callback_domain: None,
+        // Tests flip this field directly (pub) for the flag-on variants.
+        allow_anon_addresses: false,
         min_sendable: 1_000,
         max_sendable: 4_000_000_000,
         include_spark_address: false,
