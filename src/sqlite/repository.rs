@@ -4,9 +4,9 @@ use sqlx::{Row, SqlitePool};
 use crate::repository::{
     Account, AccountIdentifierKind, AccountMode, AccountProvider, BlinkToSparkIdentifierTransfer,
     IdentifierTransfer, Invoice, LnurlSenderComment, ModeSource, NewBlinkAccount,
-    NewSparkRegistration, PendingZapReceipt, ResolvedRecipient, SparkAccountMode, SparkModeUpdate,
-    UpdatedBlinkAccount, WalletKind, WebhookPayloadData, classify_refused_mode_write,
-    generate_account_id,
+    NewSparkRegistration, NostrIdentity, PendingZapReceipt, ResolvedRecipient, SparkAccountMode,
+    SparkModeUpdate, UpdatedBlinkAccount, WalletKind, WebhookPayloadData,
+    classify_refused_mode_write, generate_account_id,
 };
 use crate::webhooks::repository::{
     NewWebhookDelivery, WebhookConfig, WebhookDelivery, WebhookRepositoryError,
@@ -261,6 +261,58 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .await?
         .map(|row| map_resolved_recipient(&row))
         .transpose()
+    }
+
+    async fn upsert_nostr_identity(
+        &self,
+        account_id: &str,
+        domain: &str,
+        nostr_pubkey: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        let now = now_millis();
+        sqlx::query(
+            "INSERT INTO nostr_identities (account_id, domain, nostr_pubkey, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $4)
+             ON CONFLICT (account_id, domain)
+             DO UPDATE SET nostr_pubkey = excluded.nostr_pubkey
+             ,              updated_at = excluded.updated_at",
+        )
+        .bind(account_id)
+        .bind(domain)
+        .bind(nostr_pubkey)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_nostr_identity_by_identifier(
+        &self,
+        domain: &str,
+        identifier: &str,
+    ) -> Result<Option<NostrIdentity>, LnurlRepositoryError> {
+        let maybe_identity = sqlx::query(
+            "SELECT ni.account_id, ni.domain, ni.nostr_pubkey
+             FROM nostr_identities ni
+             JOIN account_identifiers ai
+               ON ai.account_id = ni.account_id AND ai.domain = ni.domain
+             WHERE ni.domain = $1
+               AND ai.identifier = $2
+               AND ai.identifier_kind = 'username'",
+        )
+        .bind(domain)
+        .bind(identifier)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| {
+            Ok::<_, sqlx::Error>(NostrIdentity {
+                account_id: row.try_get(0)?,
+                domain: row.try_get(1)?,
+                nostr_pubkey: row.try_get(2)?,
+            })
+        })
+        .transpose()?;
+        Ok(maybe_identity)
     }
 
     async fn get_account_by_id(
@@ -713,6 +765,13 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             return Err(LnurlRepositoryError::SourceNotOwner);
         }
 
+        // A nostr mapping must never outlive the username it attests.
+        sqlx::query("DELETE FROM nostr_identities WHERE account_id = $1 AND domain = $2")
+            .bind(&account_id)
+            .bind(domain)
+            .execute(&mut *tx)
+            .await?;
+
         tx.commit()
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
@@ -824,6 +883,15 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&transfer.identifier)
         .execute(&mut *tx)
         .await?;
+
+        // The handle changed owner: both sides must re-prove their nostr keys
+        // before the mapping is valid again.
+        sqlx::query("DELETE FROM nostr_identities WHERE domain = $1 AND account_id IN ($2, $3)")
+            .bind(&transfer.domain)
+            .bind(&transfer.source_account_id)
+            .bind(&destination_account_id)
+            .execute(&mut *tx)
+            .await?;
 
         tx.commit()
             .await
@@ -938,6 +1006,16 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&transfer.identifier)
         .execute(&mut *tx)
         .await?;
+
+        // The handle moved from a blink account to a spark account: both
+        // sides must re-prove their nostr keys before the mapping is valid
+        // again.
+        sqlx::query("DELETE FROM nostr_identities WHERE domain = $1 AND account_id IN ($2, $3)")
+            .bind(&transfer.domain)
+            .bind(&transfer.source_account_id)
+            .bind(&destination_account_id)
+            .execute(&mut *tx)
+            .await?;
 
         tx.commit()
             .await

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::BTreeMap, collections::HashSet, sync::Arc};
 use tokio::sync::{RwLock, watch};
 
 use crate::country::CountryResolver;
@@ -23,6 +23,9 @@ pub struct State<DB> {
     pub include_spark_address: bool,
     pub domains: Arc<RwLock<HashSet<String>>>,
     pub nostr_keys: Option<nostr::Keys>,
+    /// Static NIP-05 overlay (domain root `_`, official accounts): served
+    /// before the dynamic registry and immune to registration lifecycle.
+    pub nostr_static_names: Arc<BTreeMap<String, String>>,
     pub ca_cert: Option<Vec<u8>>,
     pub crl_url: Option<String>,
     pub crl: HashSet<String>,
@@ -50,6 +53,7 @@ where
             include_spark_address: self.include_spark_address,
             domains: Arc::clone(&self.domains),
             nostr_keys: self.nostr_keys.clone(),
+            nostr_static_names: Arc::clone(&self.nostr_static_names),
             ca_cert: self.ca_cert.clone(),
             crl_url: self.crl_url.clone(),
             crl: self.crl.clone(),

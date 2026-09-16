@@ -334,6 +334,16 @@ pub struct SparkUsername {
     pub description: String,
 }
 
+/// A NIP-05 mapping: `username@domain` (resolved via `account_identifiers`)
+/// is attested by the domain operator to belong to `nostr_pubkey`
+/// (lowercase hex x-only secp256k1 key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NostrIdentity {
+    pub account_id: String,
+    pub domain: String,
+    pub nostr_pubkey: String,
+}
+
 pub struct LnurlSenderComment {
     pub account_id: Option<String>,
     pub comment: String,
@@ -390,6 +400,27 @@ pub trait LnurlRepository {
         _domain: &str,
         _identifier: &str,
     ) -> Result<Option<ResolvedRecipient>, LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    /// Bind a NIP-05 nostr pubkey to an account for a domain, replacing any
+    /// previous binding for the same (account, domain).
+    async fn upsert_nostr_identity(
+        &self,
+        _account_id: &str,
+        _domain: &str,
+        _nostr_pubkey: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    /// Resolve the NIP-05 nostr pubkey attested for `identifier@domain`.
+    /// Only `username`-kind identifiers can carry a nostr mapping.
+    async fn get_nostr_identity_by_identifier(
+        &self,
+        _domain: &str,
+        _identifier: &str,
+    ) -> Result<Option<NostrIdentity>, LnurlRepositoryError> {
         Err(provider_neutral_not_implemented())
     }
 
