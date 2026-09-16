@@ -127,6 +127,13 @@ struct Args {
     #[arg(long)]
     pub nsec: Option<String>,
 
+    /// JSON object of statically-served NIP-05 names mapping local-part to
+    /// lowercase hex nostr pubkey, e.g. `{"_":"8fe5...","team":"4ffb..."}`.
+    /// Served before the dynamic registry; use for the domain root `_` and
+    /// official accounts. Invalid keys or values abort startup.
+    #[arg(long)]
+    pub nostr_static_names: Option<String>,
+
     /// Base64 encoded DER format CA certificate without begin/end certificate markers.
     /// If set, the server will use this certificate to validate api keys.
     #[arg(long)]
@@ -339,6 +346,39 @@ fn build_blink_webhook_url(args: &Args) -> Result<String, anyhow::Error> {
     ))
 }
 
+/// Parse and validate the static NIP-05 overlay config: a JSON object of
+/// `local-part -> lowercase hex nostr pubkey`. Names must use the NIP-05
+/// local-part charset; values must be 64-char lowercase hex. Fail fast on
+/// bad config — a typo'd overlay must never take down verification at
+/// runtime.
+fn parse_nostr_static_names(
+    raw: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, String>, anyhow::Error> {
+    let Some(raw) = raw else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let parsed: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(raw).map_err(|e| anyhow!("invalid nostr_static_names JSON: {e:?}"))?;
+    for (name, pubkey) in &parsed {
+        let valid_name = !name.is_empty()
+            && name.len() <= 64
+            && name.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
+            });
+        let valid_pubkey = pubkey.len() == 64
+            && pubkey
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+        if !valid_name || !valid_pubkey {
+            return Err(anyhow!(
+                "invalid nostr_static_names entry '{name}': names must match the NIP-05 \
+                 local-part charset and pubkeys must be 64-char lowercase hex"
+            ));
+        }
+    }
+    Ok(parsed)
+}
+
 fn resolve_runtime_config(
     deployment_env: Option<&str>,
     configured_spark_network: Option<spark_client::Network>,
@@ -486,9 +526,10 @@ where
         })
         .transpose()?;
 
+    let nostr_static_names = parse_nostr_static_names(args.nostr_static_names.as_deref())?;
+
     // Create watch channel for triggering background processing
     let (invoice_paid_trigger, invoice_paid_rx) = watch::channel(());
-
     // Create a shared HTTP client for webhook delivery. reqwest's default pool
     // settings keep connections warm and HTTP/2 multiplexes requests per host.
     let http_client = reqwest::Client::new();
@@ -579,6 +620,7 @@ where
         },
         domains,
         nostr_keys,
+        nostr_static_names: Arc::new(nostr_static_names),
         ca_cert,
         crl_url: args.crl_url,
         crl,
@@ -643,6 +685,10 @@ where
             post(LnurlServer::<DB>::publish_zap_receipt),
         )
         .route(
+            "/lnurlpay/{pubkey}/nostr",
+            post(LnurlServer::<DB>::register_nostr),
+        )
+        .route(
             "/lnurlpay/{pubkey}/invoice-paid",
             post(LnurlServer::<DB>::invoice_paid),
         )
@@ -657,6 +703,14 @@ where
         .route(
             "/.well-known/lnurlp/{identifier}",
             get(LnurlServer::<DB>::handle_lnurl_pay),
+        )
+        .route(
+            "/.well-known/nostr.json",
+            get(LnurlServer::<DB>::handle_nostr_json),
+        )
+        .route(
+            "/nostr/blink",
+            post(LnurlServer::<DB>::register_nostr_blink),
         )
         .route(
             "/lnurlp/{identifier}",

@@ -72,6 +72,14 @@ pub(crate) struct MockRepository {
     pub(super) spark_registrations: std::sync::Arc<Mutex<Vec<NewSparkRegistration>>>,
     pub(super) delegated_grants:
         std::sync::Arc<Mutex<HashMap<String, crate::repository::DelegatedGrant>>>,
+    /// (`account_id`, `domain`) -> nostr identity; records NIP-05 upserts.
+    pub(super) nostr_identities:
+        std::sync::Arc<Mutex<HashMap<(String, String), crate::repository::NostrIdentity>>>,
+    /// Preloaded identity returned by `get_nostr_identity_by_identifier`
+    /// (mirrors the `resolved_recipient` pattern).
+    pub(super) nostr_lookup:
+        std::sync::Arc<Mutex<Option<crate::repository::NostrIdentity>>>,
+    pub(super) nostr_lookup_calls: std::sync::Arc<Mutex<Vec<(String, String)>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -138,6 +146,33 @@ impl MockRepository {
 
     pub(super) fn spark_registration_count(&self) -> usize {
         self.spark_registrations.lock().unwrap().len()
+    }
+
+    pub(super) fn with_nostr_identity(
+        self,
+        account_id: &str,
+        domain: &str,
+        nostr_pubkey: &str,
+    ) -> Self {
+        let identity = crate::repository::NostrIdentity {
+            account_id: account_id.to_string(),
+            domain: domain.to_string(),
+            nostr_pubkey: nostr_pubkey.to_string(),
+        };
+        self.nostr_identities.lock().unwrap().insert(
+            (account_id.to_string(), domain.to_string()),
+            identity.clone(),
+        );
+        *self.nostr_lookup.lock().unwrap() = Some(identity);
+        self
+    }
+
+    pub(super) fn nostr_identity(&self, account_id: &str, domain: &str) -> Option<String> {
+        self.nostr_identities
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), domain.to_string()))
+            .map(|identity| identity.nostr_pubkey.clone())
     }
 }
 
@@ -224,10 +259,25 @@ impl LnurlRepository for MockRepository {
     }
     async fn get_spark_username_by_pubkey(
         &self,
-        _: &str,
-        _: &str,
+        domain: &str,
+        pubkey: &str,
     ) -> Result<Option<SparkUsername>, LnurlRepositoryError> {
-        Ok(None)
+        Ok(self
+            .spark_registrations
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|registration| {
+                registration.pubkey == pubkey
+                    && registration.identifier.domain == domain
+                    && registration.identifier.identifier_kind == AccountIdentifierKind::Username
+            })
+            .map(|registration| SparkUsername {
+                domain: registration.identifier.domain.clone(),
+                pubkey: registration.pubkey.clone(),
+                username: registration.identifier.identifier.clone(),
+                description: registration.identifier.description.clone(),
+            }))
     }
     async fn resolve_recipient_by_identifier(
         &self,
@@ -239,6 +289,34 @@ impl LnurlRepository for MockRepository {
             .unwrap()
             .push((domain.to_string(), identifier.to_string()));
         Ok(self.resolved_recipient.lock().unwrap().clone())
+    }
+    async fn upsert_nostr_identity(
+        &self,
+        account_id: &str,
+        domain: &str,
+        nostr_pubkey: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        let mut identities = self.nostr_identities.lock().unwrap();
+        identities.insert(
+            (account_id.to_string(), domain.to_string()),
+            crate::repository::NostrIdentity {
+                account_id: account_id.to_string(),
+                domain: domain.to_string(),
+                nostr_pubkey: nostr_pubkey.to_string(),
+            },
+        );
+        Ok(())
+    }
+    async fn get_nostr_identity_by_identifier(
+        &self,
+        domain: &str,
+        identifier: &str,
+    ) -> Result<Option<crate::repository::NostrIdentity>, LnurlRepositoryError> {
+        self.nostr_lookup_calls
+            .lock()
+            .unwrap()
+            .push((domain.to_string(), identifier.to_string()));
+        Ok(self.nostr_lookup.lock().unwrap().clone())
     }
     async fn get_account_by_spark_pubkey(
         &self,
@@ -776,6 +854,7 @@ pub(super) async fn internal_route_test_state_full(
         include_spark_address: false,
         domains: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
         nostr_keys: None,
+        nostr_static_names: Arc::new(std::collections::BTreeMap::new()),
         ca_cert: None,
         crl_url: None,
         crl: std::collections::HashSet::new(),
@@ -1001,6 +1080,39 @@ pub(super) async fn start_blink_fixed_invoice_mock_server(
             .expect("mock Blink server should serve");
     });
     (format!("http://{addr}/graphql"), calls, bodies)
+}
+
+pub(super) async fn start_blink_me_mock_server(username: Option<&'static str>) -> String {
+    let app = Router::new().route(
+        "/graphql",
+        post(move |headers: axum::http::HeaderMap| async move {
+            let auth = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            if auth != "Bearer good-token" {
+                return Json(json!({ "errors": [{"message": "unauthorized"}] }));
+            }
+            let me = match username {
+                Some(username) => json!({ "id": "blink-account-1", "username": username }),
+                None => json!(null),
+            };
+            Json(json!({ "data": { "me": me } }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("mock listener should have addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("mock Blink me server should serve");
+    });
+    format!("http://{addr}/graphql")
 }
 
 pub(super) async fn start_blink_status_mock_server(
