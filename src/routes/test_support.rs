@@ -853,6 +853,12 @@ pub(super) async fn internal_route_test_state_full(
         domains: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
         nostr_keys: None,
         nostr_static_names: Arc::new(std::collections::BTreeMap::new()),
+        nostr_json_rate_limiter: Arc::new(crate::rate_limit::PerIpRateLimiter::new(
+            1_000,
+            std::time::Duration::from_mins(1),
+            1_000,
+            true,
+        )),
         ca_cert: None,
         crl_url: None,
         crl: std::collections::HashSet::new(),
