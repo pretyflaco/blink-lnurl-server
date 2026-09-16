@@ -77,8 +77,7 @@ pub(crate) struct MockRepository {
         std::sync::Arc<Mutex<HashMap<(String, String), crate::repository::NostrIdentity>>>,
     /// Preloaded identity returned by `get_nostr_identity_by_identifier`
     /// (mirrors the `resolved_recipient` pattern).
-    pub(super) nostr_lookup:
-        std::sync::Arc<Mutex<Option<crate::repository::NostrIdentity>>>,
+    pub(super) nostr_lookup: std::sync::Arc<Mutex<Option<crate::repository::NostrIdentity>>>,
     pub(super) nostr_lookup_calls: std::sync::Arc<Mutex<Vec<(String, String)>>>,
 }
 
@@ -195,15 +194,14 @@ impl LnurlRepository for MockRepository {
         &self,
         grant: &crate::repository::NewDelegatedGrant,
     ) -> Result<crate::repository::DelegatedGrant, LnurlRepositoryError> {
-        if let Some(existing) = self
+        let conflicting = self
             .delegated_grants
             .lock()
             .unwrap()
             .get(&grant.delegated_pubkey)
-        {
-            if existing.owner_pubkey != grant.owner_pubkey {
-                return Err(LnurlRepositoryError::DelegatedGrantConflict);
-            }
+            .is_some_and(|existing| existing.owner_pubkey != grant.owner_pubkey);
+        if conflicting {
+            return Err(LnurlRepositoryError::DelegatedGrantConflict);
         }
         let record = crate::repository::DelegatedGrant {
             delegated_pubkey: grant.delegated_pubkey.clone(),
