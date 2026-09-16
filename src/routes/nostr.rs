@@ -56,7 +56,7 @@ where
         headers: HeaderMap,
         Extension(state): Extension<State<DB>>,
     ) -> Result<Response, (StatusCode, Json<Value>)> {
-        if !state.ip_rate_limiter.check(client_ip(&headers)) {
+        if !state.nostr_json_rate_limiter.check(client_ip(&headers)) {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(Value::String(ERROR_RATE_LIMITED.into())),

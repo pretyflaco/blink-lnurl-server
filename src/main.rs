@@ -184,6 +184,12 @@ struct Args {
     #[arg(long, default_value = "10")]
     pub mode_requests_per_ip_per_minute: u32,
 
+    /// Maximum public NIP-05 nostr.json lookups accepted per client IP per
+    /// minute. Verification traffic is read-only and cheap, so this budget is
+    /// deliberately generous and independent of the signed-request budget.
+    #[arg(long, default_value = "60")]
+    pub nostr_json_requests_per_ip_per_minute: u32,
+
     /// Daily cap on country lookups across all client IPs. Over budget, mode
     /// writes still succeed and stored evidence stops refreshing.
     #[arg(long, default_value = "5000")]
@@ -582,6 +588,12 @@ where
         RATE_LIMIT_TRACKED_IPS,
         runtime_config.local_env,
     ));
+    let nostr_json_rate_limiter = Arc::new(rate_limit::PerIpRateLimiter::new(
+        args.nostr_json_requests_per_ip_per_minute,
+        std::time::Duration::from_mins(1),
+        RATE_LIMIT_TRACKED_IPS,
+        true,
+    ));
 
     let country_lookup_budget = Arc::new(rate_limit::GlobalBudget::new(
         args.country_lookups_per_day,
@@ -613,6 +625,7 @@ where
         domains,
         nostr_keys,
         nostr_static_names: Arc::new(nostr_static_names),
+        nostr_json_rate_limiter,
         ca_cert,
         crl_url: args.crl_url,
         crl,

@@ -14,6 +14,9 @@ pub struct State<DB> {
     /// Shared per-IP budget for the mode route and for the paid country
     /// lookups the signed-request handlers make.
     pub ip_rate_limiter: Arc<PerIpRateLimiter>,
+    /// Independent, generous per-IP budget for the public NIP-05 lookup —
+    /// must never be starved by (or starve) the signed-request budget.
+    pub nostr_json_rate_limiter: Arc<PerIpRateLimiter>,
     /// Aggregate daily cap on vendor lookups, shared by every route.
     pub country_lookup_budget: Arc<GlobalBudget>,
     pub scheme: String,
@@ -54,6 +57,7 @@ where
             domains: Arc::clone(&self.domains),
             nostr_keys: self.nostr_keys.clone(),
             nostr_static_names: Arc::clone(&self.nostr_static_names),
+            nostr_json_rate_limiter: Arc::clone(&self.nostr_json_rate_limiter),
             ca_cert: self.ca_cert.clone(),
             crl_url: self.crl_url.clone(),
             crl: self.crl.clone(),
