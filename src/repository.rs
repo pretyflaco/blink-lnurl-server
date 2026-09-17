@@ -404,12 +404,18 @@ pub trait LnurlRepository {
     }
 
     /// Bind a NIP-05 nostr pubkey to an account for a domain, replacing any
-    /// previous binding for the same (account, domain).
+    /// previous binding for the same (account, domain). **Conditional on the
+    /// account currently owning `username` on that domain** — the write is
+    /// silently skipped (0 rows) otherwise, and the caller must treat that as
+    /// [`LnurlRepositoryError::InvalidOwnership`]: the proof attests the exact
+    /// handle, so a binding may only exist while that handle belongs to the
+    /// account.
     async fn upsert_nostr_identity(
         &self,
         _account_id: &str,
         _domain: &str,
         _nostr_pubkey: &str,
+        _username: &str,
     ) -> Result<(), LnurlRepositoryError> {
         Err(provider_neutral_not_implemented())
     }
@@ -3318,5 +3324,304 @@ pub mod provider_neutral_schema_tests {
         .await
         .unwrap();
         assert_eq!(count, 1, "missing Postgres index/constraint {index}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod nostr_shared_tests {
+    //! Real-backend NIP-05 repository behavior, run against BOTH backends
+    //! (PostgreSQL via `make test-integration`, SQLite in-memory always).
+    use super::{
+        AccountIdentifierKind, BlinkToSparkIdentifierTransfer, IdentifierTransfer, LnurlRepository,
+        LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration,
+        WalletKind,
+    };
+
+    const DOMAIN: &str = "example.com";
+
+    fn spark_reg(pubkey: &str, username: &str) -> NewSparkRegistration {
+        NewSparkRegistration {
+            account_id: None,
+            pubkey: pubkey.to_string(),
+            identifier: NewAccountIdentifier {
+                domain: DOMAIN.to_string(),
+                identifier: username.to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: String::new(),
+            },
+        }
+    }
+
+    fn blink_reg(blink_account_id: &str, username: &str) -> NewBlinkAccount {
+        NewBlinkAccount {
+            account_id: None,
+            blink_account_id: blink_account_id.to_string(),
+            btc_wallet_id: format!("{blink_account_id}-btc"),
+            usd_wallet_id: format!("{blink_account_id}-usd"),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![NewAccountIdentifier {
+                domain: DOMAIN.to_string(),
+                identifier: username.to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: String::new(),
+            }],
+        }
+    }
+
+    pub(crate) async fn insert_and_lookup<DB: LnurlRepository + Send + Sync>(db: &DB) {
+        db.upsert_spark_registration(&spark_reg("02aa", "alice"))
+            .await
+            .unwrap();
+        let account = db
+            .get_account_by_spark_pubkey("02aa")
+            .await
+            .unwrap()
+            .expect("spark account exists");
+        db.upsert_nostr_identity(&account.account_id, DOMAIN, &"11".repeat(32), "alice")
+            .await
+            .unwrap();
+
+        let identity = db
+            .get_nostr_identity_by_identifier(DOMAIN, "alice")
+            .await
+            .unwrap()
+            .expect("binding resolves");
+        assert_eq!(identity.nostr_pubkey, "11".repeat(32));
+        assert_eq!(identity.account_id, account.account_id);
+    }
+
+    pub(crate) async fn lookup_misses_wrong_domain_or_identifier<
+        DB: LnurlRepository + Send + Sync,
+    >(
+        db: &DB,
+    ) {
+        db.upsert_spark_registration(&spark_reg("02bb", "bob"))
+            .await
+            .unwrap();
+        let account = db
+            .get_account_by_spark_pubkey("02bb")
+            .await
+            .unwrap()
+            .expect("spark account exists");
+        db.upsert_nostr_identity(&account.account_id, DOMAIN, &"22".repeat(32), "bob")
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_nostr_identity_by_identifier("other.com", "bob")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "nobody")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    pub(crate) async fn replace_updates_pubkey<DB: LnurlRepository + Send + Sync>(db: &DB) {
+        db.upsert_spark_registration(&spark_reg("02cc", "carol"))
+            .await
+            .unwrap();
+        let account = db
+            .get_account_by_spark_pubkey("02cc")
+            .await
+            .unwrap()
+            .expect("spark account exists");
+        db.upsert_nostr_identity(&account.account_id, DOMAIN, &"33".repeat(32), "carol")
+            .await
+            .unwrap();
+        db.upsert_nostr_identity(&account.account_id, DOMAIN, &"44".repeat(32), "carol")
+            .await
+            .unwrap();
+
+        let identity = db
+            .get_nostr_identity_by_identifier(DOMAIN, "carol")
+            .await
+            .unwrap()
+            .expect("binding resolves");
+        assert_eq!(identity.nostr_pubkey, "44".repeat(32));
+    }
+
+    pub(crate) async fn upsert_requires_username_ownership<DB: LnurlRepository + Send + Sync>(
+        db: &DB,
+    ) {
+        db.upsert_spark_registration(&spark_reg("02dd", "dave"))
+            .await
+            .unwrap();
+        let account = db
+            .get_account_by_spark_pubkey("02dd")
+            .await
+            .unwrap()
+            .expect("spark account exists");
+
+        let err = db
+            .upsert_nostr_identity(&account.account_id, DOMAIN, &"55".repeat(32), "not-dave")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LnurlRepositoryError::InvalidOwnership));
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "dave")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    pub(crate) async fn unregister_clears_binding<DB: LnurlRepository + Send + Sync>(db: &DB) {
+        db.upsert_spark_registration(&spark_reg("02ee", "erin"))
+            .await
+            .unwrap();
+        let account = db
+            .get_account_by_spark_pubkey("02ee")
+            .await
+            .unwrap()
+            .expect("spark account exists");
+        db.upsert_nostr_identity(&account.account_id, DOMAIN, &"66".repeat(32), "erin")
+            .await
+            .unwrap();
+
+        db.delete_spark_registration(DOMAIN, "02ee", "erin")
+            .await
+            .unwrap();
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "erin")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    pub(crate) async fn spark_transfer_clears_both_sides<DB: LnurlRepository + Send + Sync>(
+        db: &DB,
+    ) {
+        db.upsert_spark_registration(&spark_reg("02ff", "frank"))
+            .await
+            .unwrap();
+        db.upsert_spark_registration(&spark_reg("0211", "grace"))
+            .await
+            .unwrap();
+        let source = db
+            .get_account_by_spark_pubkey("02ff")
+            .await
+            .unwrap()
+            .expect("source account");
+        let destination = db
+            .get_account_by_spark_pubkey("0211")
+            .await
+            .unwrap()
+            .expect("destination account");
+        db.upsert_nostr_identity(&source.account_id, DOMAIN, &"77".repeat(32), "frank")
+            .await
+            .unwrap();
+        db.upsert_nostr_identity(&destination.account_id, DOMAIN, &"88".repeat(32), "grace")
+            .await
+            .unwrap();
+
+        db.transfer_identifier(&IdentifierTransfer {
+            domain: DOMAIN.to_string(),
+            identifier: "frank".to_string(),
+            source_account_id: source.account_id.clone(),
+            destination_spark_pubkey: "0211".to_string(),
+            description: String::new(),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "frank")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "grace")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    pub(crate) async fn blink_to_spark_transfer_clears_binding<
+        DB: LnurlRepository + Send + Sync,
+    >(
+        db: &DB,
+    ) {
+        db.create_blink_account(&blink_reg("blink-1", "heidi"))
+            .await
+            .unwrap();
+        db.upsert_spark_registration(&spark_reg("0222", "ivan"))
+            .await
+            .unwrap();
+        let source = db
+            .resolve_recipient_by_identifier(DOMAIN, "heidi")
+            .await
+            .unwrap()
+            .expect("blink account resolves");
+        db.upsert_nostr_identity(&source.account_id, DOMAIN, &"99".repeat(32), "heidi")
+            .await
+            .unwrap();
+
+        db.transfer_blink_identifier_to_spark(&BlinkToSparkIdentifierTransfer {
+            domain: DOMAIN.to_string(),
+            identifier: "heidi".to_string(),
+            source_account_id: source.account_id.clone(),
+            destination_spark_pubkey: "0222".to_string(),
+            description: String::new(),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "heidi")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Review M1 regression: a username change must retire the binding that
+    /// was proven for the OLD local-part; an idempotent re-registration of
+    /// the SAME username must keep it.
+    pub(crate) async fn username_replacement_clears_binding<DB: LnurlRepository + Send + Sync>(
+        db: &DB,
+    ) {
+        db.upsert_spark_registration(&spark_reg("0233", "judith"))
+            .await
+            .unwrap();
+        let account = db
+            .get_account_by_spark_pubkey("0233")
+            .await
+            .unwrap()
+            .expect("spark account exists");
+        db.upsert_nostr_identity(&account.account_id, DOMAIN, &"aa".repeat(32), "judith")
+            .await
+            .unwrap();
+
+        // Idempotent same-username re-registration keeps the binding.
+        db.upsert_spark_registration(&spark_reg("0233", "judith"))
+            .await
+            .unwrap();
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "judith")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Renaming replaces the username identifier — and the binding proven
+        // for the old name must NOT silently cover the new one.
+        db.upsert_spark_registration(&spark_reg("0233", "judith2"))
+            .await
+            .unwrap();
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "judith2")
+                .await
+                .unwrap()
+                .is_none(),
+            "renamed handle must not inherit the old handle's proven binding"
+        );
     }
 }

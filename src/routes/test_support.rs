@@ -77,6 +77,8 @@ pub(crate) struct MockRepository {
     /// (mirrors the `resolved_recipient` pattern).
     pub(super) nostr_lookup: std::sync::Arc<Mutex<Option<crate::repository::NostrIdentity>>>,
     pub(super) nostr_lookup_calls: std::sync::Arc<Mutex<Vec<(String, String)>>>,
+    /// Injected failure for the next nostr upsert (storage-failure coverage).
+    pub(super) nostr_upsert_error: std::sync::Arc<Mutex<Option<LnurlRepositoryError>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -164,6 +166,10 @@ impl MockRepository {
         self
     }
 
+    pub(super) fn fail_next_nostr_upsert(&self, error: LnurlRepositoryError) {
+        *self.nostr_upsert_error.lock().unwrap() = Some(error);
+    }
+
     pub(super) fn nostr_identity(&self, account_id: &str, domain: &str) -> Option<String> {
         self.nostr_identities
             .lock()
@@ -233,7 +239,36 @@ impl LnurlRepository for MockRepository {
         account_id: &str,
         domain: &str,
         nostr_pubkey: &str,
+        username: &str,
     ) -> Result<(), LnurlRepositoryError> {
+        if let Some(error) = self.nostr_upsert_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        // Mirror the real backends' ownership contract: the write only lands
+        // while the account currently owns the exact username being proven.
+        let owned = self
+            .spark_registrations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|registration| {
+                registration.account_id.as_deref() == Some(account_id)
+                    && registration.identifier.domain == domain
+                    && registration.identifier.identifier == username
+            })
+            || self
+                .resolved_recipient
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|recipient| {
+                    recipient.account_id == account_id
+                        && recipient.domain == domain
+                        && recipient.identifier == username
+                });
+        if !owned {
+            return Err(LnurlRepositoryError::InvalidOwnership);
+        }
         let mut identities = self.nostr_identities.lock().unwrap();
         identities.insert(
             (account_id.to_string(), domain.to_string()),
@@ -1024,7 +1059,19 @@ pub(super) async fn start_blink_fixed_invoice_mock_server(
     (format!("http://{addr}/graphql"), calls, bodies)
 }
 
-pub(super) async fn start_blink_me_mock_server(username: Option<&'static str>) -> String {
+/// Behaviour of the mocked `me` endpoint. Clone: axum handlers require
+/// Clone closures, so captured handler state must be Clone.
+#[derive(Clone, Copy)]
+pub(super) enum MeMock {
+    /// Successful account with this username.
+    Ok(&'static str),
+    /// GraphQL-envelope auth error (authenticated route, bad token).
+    GraphqlUnauthorized,
+    /// Plain HTTP 401 from an edge/gateway in front of GraphQL.
+    HttpUnauthorized,
+}
+
+pub(super) async fn start_blink_me_mock_server(mode: MeMock) -> String {
     let app = Router::new().route(
         "/graphql",
         post(move |headers: axum::http::HeaderMap| async move {
@@ -1033,14 +1080,25 @@ pub(super) async fn start_blink_me_mock_server(username: Option<&'static str>) -
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_string();
-            if auth != "Bearer good-token" {
-                return Json(json!({ "errors": [{"message": "unauthorized"}] }));
-            }
-            let me = match username {
-                Some(username) => json!({ "id": "blink-account-1", "username": username }),
-                None => json!(null),
+            let (status, body) = match mode {
+                MeMock::HttpUnauthorized => (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    json!({ "error": "token rejected by gateway" }),
+                ),
+                _ if auth != "Bearer good-token" => (
+                    axum::http::StatusCode::OK,
+                    json!({ "errors": [{"message": "unauthorized"}] }),
+                ),
+                MeMock::Ok(username) => (
+                    axum::http::StatusCode::OK,
+                    json!({ "data": { "me": { "id": "blink-account-1", "username": username } } }),
+                ),
+                MeMock::GraphqlUnauthorized => (
+                    axum::http::StatusCode::OK,
+                    json!({ "errors": [{"message": "unauthorized"}] }),
+                ),
             };
-            Json(json!({ "data": { "me": me } }))
+            (status, Json(body)).into_response()
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
