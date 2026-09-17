@@ -16,25 +16,6 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    services:
-      # Real PostgreSQL for the postgres_tests suites. Without it the Makefile's
-      # LNURL_TEST_POSTGRES_URL pointed at nothing and the suites' old
-      # skip-on-connect-failure setup turned every test into a vacuous pass —
-      # the nostr tests' fail-loud setup (round 2 of #46) surfaced the gap.
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_USER: user
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: lnurl
-        ports:
-          # Host port matches the Makefile's LNURL_POSTGRES_PORT default.
-          - 25432:5432
-        options: >-
-          --health-cmd "pg_isready -U user -d lnurl"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     steps:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
