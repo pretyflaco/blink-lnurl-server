@@ -68,7 +68,7 @@ where
             // answer — and we never enumerate the map.
             return Err(not_found());
         };
-        if !valid_nip05_local_part(name) {
+        if !is_valid_nip05_local_part(name) {
             return Err(not_found());
         }
 
@@ -229,7 +229,10 @@ where
             .blink_me(&token)
             .await
             .map_err(|e| match e {
-                blink_client::BlinkClientError::Graphql(_) => (
+                // Only definitive auth signals answer 401 (round-2 review):
+                // HTTP 401/403 or an authenticated query resolving to me:null.
+                // Envelope errors may be upstream failures — those are outages.
+                blink_client::BlinkClientError::Unauthorized => (
                     StatusCode::UNAUTHORIZED,
                     Json(Value::String("invalid or expired token".into())),
                 ),
@@ -387,11 +390,6 @@ pub(crate) fn is_canonical_nostr_pubkey(hex: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// Route-facing wrapper for local-part validation.
-pub(super) fn valid_nip05_local_part(name: &str) -> bool {
-    is_valid_nip05_local_part(name)
-}
-
 /// Accept only canonical lowercase 64-char hex x-only pubkeys. Refuse npubs
 /// and mixed case: the spec requires lowercase hex in nostr.json.
 pub(super) fn normalize_nostr_pubkey(
@@ -492,7 +490,7 @@ mod tests {
         proof_event_at(keys, &[["lnaddress", lnaddress]], kind, None)
     }
 
-    /// Proof builder with full control: arbitrary tags, and a created_at
+    /// Proof builder with full control: arbitrary tags, and a `created_at`
     /// offset (seconds from now) for freshness tests.
     fn proof_event_at(
         keys: &Keys,
@@ -552,14 +550,14 @@ mod tests {
 
     #[test]
     fn valid_local_parts_follow_nip05_charset() {
-        assert!(valid_nip05_local_part("alice"));
-        assert!(valid_nip05_local_part("a-b_c.d01"));
-        assert!(valid_nip05_local_part("_"));
-        assert!(!valid_nip05_local_part(""));
-        assert!(!valid_nip05_local_part("Alice"));
-        assert!(!valid_nip05_local_part("alice@blink.sv"));
-        assert!(!valid_nip05_local_part("sp ace"));
-        assert!(!valid_nip05_local_part(&"x".repeat(65)));
+        assert!(is_valid_nip05_local_part("alice"));
+        assert!(is_valid_nip05_local_part("a-b_c.d01"));
+        assert!(is_valid_nip05_local_part("_"));
+        assert!(!is_valid_nip05_local_part(""));
+        assert!(!is_valid_nip05_local_part("Alice"));
+        assert!(!is_valid_nip05_local_part("alice@blink.sv"));
+        assert!(!is_valid_nip05_local_part("sp ace"));
+        assert!(!is_valid_nip05_local_part(&"x".repeat(65)));
     }
 
     #[test]
@@ -920,7 +918,7 @@ mod tests {
             &keys,
             &[["lnaddress", lnaddress]],
             Kind::Authentication,
-            Some(-(super::super::ACCEPTABLE_TIME_DIFF_SECS as i64) * 2),
+            Some(-(super::super::ACCEPTABLE_TIME_DIFF_SECS.cast_signed()) * 2),
         );
         assert!(verify_nostr_identity_proof(&stale, &pubkey, lnaddress, now_u64()).is_err());
 
@@ -928,7 +926,7 @@ mod tests {
             &keys,
             &[["lnaddress", lnaddress]],
             Kind::Authentication,
-            Some((super::super::ACCEPTABLE_TIME_DIFF_SECS as i64) * 2),
+            Some((super::super::ACCEPTABLE_TIME_DIFF_SECS.cast_signed()) * 2),
         );
         assert!(verify_nostr_identity_proof(&future, &pubkey, lnaddress, now_u64()).is_err());
 
@@ -1359,6 +1357,201 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
     }
 
+    #[test]
+    fn proof_verifier_accepts_exact_freshness_boundary() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key().to_hex();
+        let lnaddress = "alice@localhost:8080";
+        let window = super::super::ACCEPTABLE_TIME_DIFF_SECS.cast_signed();
+
+        // Exactly ±window is inside ("too far off" is strict inequality).
+        for offset in [-window, window] {
+            let proof = proof_event_at(
+                &keys,
+                &[["lnaddress", lnaddress]],
+                Kind::Authentication,
+                Some(offset),
+            );
+            assert!(
+                verify_nostr_identity_proof(&proof, &pubkey, lnaddress, now_u64()).is_ok(),
+                "offset {offset} sits exactly on the boundary and must pass"
+            );
+        }
+        // One second beyond on either side is stale/future.
+        for offset in [-window - 1, window + 1] {
+            let proof = proof_event_at(
+                &keys,
+                &[["lnaddress", lnaddress]],
+                Kind::Authentication,
+                Some(offset),
+            );
+            assert!(
+                verify_nostr_identity_proof(&proof, &pubkey, lnaddress, now_u64()).is_err(),
+                "offset {offset} is beyond the boundary and must fail"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nostr_json_maps_lookup_storage_failure_to_500() {
+        let repo = MockRepository::default();
+        repo.fail_nostr_lookups(LnurlRepositoryError::General(anyhow::anyhow!("db gone")));
+        let state = route_test_state_with_country_resolver(
+            repo,
+            crate::country::CountryResolver::disabled(),
+        )
+        .await;
+        let app = nostr_json_app(state);
+        let (status, _) = call(
+            app.clone(),
+            "GET",
+            "/.well-known/nostr.json?name=alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn register_nostr_spark_maps_lost_ownership_to_409() {
+        let nostr_keys = Keys::generate();
+        let nostr_pubkey = nostr_keys.public_key().to_hex();
+        let timestamp = now_u64();
+        let auth =
+            spark_client::Client::build_auth_payload(&format!("nostr:{nostr_pubkey}"), timestamp)
+                .await
+                .expect("test auth payload signs");
+        let repo = MockRepository::default().with_spark_mode(&auth.pubkey, None);
+        repo.spark_registrations
+            .lock()
+            .unwrap()
+            .push(spark_registration(&auth.pubkey, "alice"));
+        // Ownership of the exact username is lost between proof and write.
+        repo.fail_next_nostr_upsert(LnurlRepositoryError::InvalidOwnership);
+        let state = route_test_state_with_country_resolver(
+            repo,
+            crate::country::CountryResolver::disabled(),
+        )
+        .await;
+        let app = Router::new()
+            .route(
+                "/lnurlpay/{pubkey}/nostr",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr),
+            )
+            .layer(Extension(state));
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            &format!("/lnurlpay/{}/nostr", auth.pubkey),
+            None,
+            Some(json!({
+                "nostr_pubkey": nostr_pubkey,
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+                "signature": auth.register_signature,
+                "timestamp": timestamp,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn register_nostr_blink_maps_upstream_http_403_to_unauthorized() {
+        let endpoint = start_blink_me_mock_server(MeMock::HttpForbidden).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_recipient("alice"));
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        let app = Router::new()
+            .route(
+                "/nostr/blink",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr_blink),
+            )
+            .layer(Extension(state));
+        let nostr_keys = Keys::generate();
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/nostr/blink",
+            Some("Bearer good-token"),
+            Some(json!({
+                "nostr_pubkey": nostr_keys.public_key().to_hex(),
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn register_nostr_blink_maps_null_me_to_unauthorized() {
+        let endpoint = start_blink_me_mock_server(MeMock::NullMe).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_recipient("alice"));
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        let app = Router::new()
+            .route(
+                "/nostr/blink",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr_blink),
+            )
+            .layer(Extension(state));
+        let nostr_keys = Keys::generate();
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/nostr/blink",
+            Some("Bearer good-token"),
+            Some(json!({
+                "nostr_pubkey": nostr_keys.public_key().to_hex(),
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn register_nostr_blink_maps_non_auth_graphql_error_to_502() {
+        // An envelope error is not a credential signal (round-2 review):
+        // upstream resolver failures are outages, not unauthorized.
+        let endpoint = start_blink_me_mock_server(MeMock::GraphqlError).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_recipient("alice"));
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        let app = Router::new()
+            .route(
+                "/nostr/blink",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr_blink),
+            )
+            .layer(Extension(state));
+        let nostr_keys = Keys::generate();
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/nostr/blink",
+            Some("Bearer good-token"),
+            Some(json!({
+                "nostr_pubkey": nostr_keys.public_key().to_hex(),
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
     #[tokio::test]
     async fn register_nostr_blink_rejects_bad_token_and_unprovisioned_username() {
         let endpoint = start_blink_me_mock_server(MeMock::Ok("alice")).await;
@@ -1390,7 +1583,9 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        // Bad token.
+        // Bad token: the mock answers with a GraphQL-envelope error, which is
+        // NOT a definitive credential signal under the round-2 contract —
+        // that is an upstream-shaped failure (502), not 401.
         let repo = MockRepository::default().with_resolved_recipient(blink_recipient("alice"));
         let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
         let app = Router::new()
@@ -1414,6 +1609,6 @@ mod tests {
             })),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
 }

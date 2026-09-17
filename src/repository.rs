@@ -336,14 +336,17 @@ pub struct SparkUsername {
     pub description: String,
 }
 
-/// A NIP-05 mapping: `username@domain` (resolved via `account_identifiers`)
-/// is attested by the domain operator to belong to `nostr_pubkey`
-/// (lowercase hex x-only secp256k1 key).
+/// A NIP-05 mapping: `username@domain` is attested by the domain operator to
+/// belong to `nostr_pubkey` (lowercase hex x-only secp256k1 key). The
+/// `username` is stored with the binding — it is the local-part the proof
+/// event actually attested, and resolution matches against it, so a proof
+/// for one handle can never serve a sibling handle of the same account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NostrIdentity {
     pub account_id: String,
     pub domain: String,
     pub nostr_pubkey: String,
+    pub username: String,
 }
 
 pub struct LnurlSenderComment {
@@ -437,13 +440,12 @@ pub trait LnurlRepository {
         Err(provider_neutral_not_implemented())
     }
 
-    /// Bind a NIP-05 nostr pubkey to an account for a domain, replacing any
-    /// previous binding for the same (account, domain). **Conditional on the
-    /// account currently owning `username` on that domain** — the write is
-    /// silently skipped (0 rows) otherwise, and the caller must treat that as
-    /// [`LnurlRepositoryError::InvalidOwnership`]: the proof attests the exact
-    /// handle, so a binding may only exist while that handle belongs to the
-    /// account.
+    /// Bind a NIP-05 nostr pubkey to the EXACT `username` the proof attested
+    /// (keyed `(account, domain, username)`; a sibling handle of the same
+    /// account gets no coverage). **Conditional on the account currently
+    /// owning `username` on that domain** — otherwise the caller must see
+    /// [`LnurlRepositoryError::InvalidOwnership`]: a binding may only exist
+    /// while that handle belongs to the account.
     async fn upsert_nostr_identity(
         &self,
         _account_id: &str,
@@ -3399,7 +3401,7 @@ pub mod provider_neutral_schema_tests {
 #[cfg(test)]
 pub(crate) mod nostr_shared_tests {
     //! Real-backend NIP-05 repository behavior, run against BOTH backends
-    //! (PostgreSQL via `make test-integration`, SQLite in-memory always).
+    //! (`PostgreSQL` via `make test-integration`, `SQLite` in-memory always).
     use super::{
         AccountIdentifierKind, BlinkToSparkIdentifierTransfer, IdentifierTransfer, LnurlRepository,
         LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration,
@@ -3648,6 +3650,57 @@ pub(crate) mod nostr_shared_tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Round-2 review: Blink Core may provision several usernames for one
+    /// account/domain; a proof for one handle must not serve its sibling.
+    pub(crate) async fn binding_is_per_proven_handle<DB: LnurlRepository + Send + Sync>(db: &DB) {
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: None,
+            blink_account_id: "blink-multi".to_string(),
+            btc_wallet_id: "btc".to_string(),
+            usd_wallet_id: "usd".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![
+                NewAccountIdentifier {
+                    domain: DOMAIN.to_string(),
+                    identifier: "u1".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: String::new(),
+                },
+                NewAccountIdentifier {
+                    domain: DOMAIN.to_string(),
+                    identifier: "u2".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: String::new(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+        let account = db
+            .resolve_recipient_by_identifier(DOMAIN, "u1")
+            .await
+            .unwrap()
+            .expect("u1 resolves");
+
+        db.upsert_nostr_identity(&account.account_id, DOMAIN, &"bb".repeat(32), "u1")
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "u1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "u2")
+                .await
+                .unwrap()
+                .is_none(),
+            "a proof for u1 must never serve sibling handle u2"
         );
     }
 

@@ -273,10 +273,12 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let now = now_millis();
         // The write only lands while the account currently owns the exact
         // username the proof attests — a transferred or renamed handle can
-        // never carry a binding it did not earn.
+        // never carry a binding it did not earn. SQLite is single-writer, so
+        // the conditional statement is atomic without an explicit lock (the
+        // PostgreSQL backend locks the ownership row in a transaction).
         let result = sqlx::query(
-            "INSERT INTO nostr_identities (account_id, domain, nostr_pubkey, created_at, updated_at)
-             SELECT $1, $2, $3, $4, $4
+            "INSERT INTO nostr_identities (account_id, domain, nostr_pubkey, username, created_at, updated_at)
+             SELECT $1, $2, $3, $5, $4, $4
              WHERE EXISTS (
                  SELECT 1 FROM account_identifiers ai
                  WHERE ai.account_id = $1
@@ -284,7 +286,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                    AND ai.identifier = $5
                    AND ai.identifier_kind = 'username'
              )
-             ON CONFLICT (account_id, domain)
+             ON CONFLICT (account_id, domain, username)
              DO UPDATE SET nostr_pubkey = excluded.nostr_pubkey
              ,              updated_at = excluded.updated_at",
         )
@@ -307,10 +309,12 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         identifier: &str,
     ) -> Result<Option<NostrIdentity>, LnurlRepositoryError> {
         let maybe_identity = sqlx::query(
-            "SELECT ni.account_id, ni.domain, ni.nostr_pubkey
+            "SELECT ni.account_id, ni.domain, ni.nostr_pubkey, ni.username
              FROM nostr_identities ni
              JOIN account_identifiers ai
-               ON ai.account_id = ni.account_id AND ai.domain = ni.domain
+               ON ai.account_id = ni.account_id
+              AND ai.domain = ni.domain
+              AND ai.identifier = ni.username
              WHERE ni.domain = $1
                AND ai.identifier = $2
                AND ai.identifier_kind = 'username'",
@@ -324,6 +328,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                 account_id: row.try_get(0)?,
                 domain: row.try_get(1)?,
                 nostr_pubkey: row.try_get(2)?,
+                username: row.try_get(3)?,
             })
         })
         .transpose()?;
@@ -2495,5 +2500,11 @@ mod nostr_sqlite_tests {
     async fn username_replacement_clears_binding() {
         let db = setup().await;
         nostr_shared_tests::username_replacement_clears_binding(&db).await;
+    }
+
+    #[tokio::test]
+    async fn binding_is_per_proven_handle() {
+        let db = setup().await;
+        nostr_shared_tests::binding_is_per_proven_handle(&db).await;
     }
 }
