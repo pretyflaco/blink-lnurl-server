@@ -114,10 +114,12 @@ impl Client {
             return Err(BlinkClientError::Graphql(envelope.errors));
         }
 
-        envelope
+        let data = envelope
             .data
-            .and_then(|data| data.me)
-            .ok_or(BlinkClientError::Unauthorized)
+            .ok_or(BlinkClientError::MalformedResponse("missing GraphQL data"))?;
+        // `me: null` on an authenticated query is a definitive auth failure;
+        // a missing `data` object entirely is a malformed upstream response.
+        data.me.ok_or(BlinkClientError::Unauthorized)
     }
 
     async fn execute<T>(
