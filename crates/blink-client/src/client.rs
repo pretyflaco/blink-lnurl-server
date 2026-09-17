@@ -105,13 +105,7 @@ impl Client {
         // upstream outage. Transport and server failures stay what they are.
         let status = response.status();
         if status.as_u16() == 401 || status.as_u16() == 403 {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| String::from("unauthorized"));
-            return Err(BlinkClientError::Graphql(vec![GraphqlError {
-                message: format!("unauthorized (HTTP {}): {body}", status.as_u16()),
-            }]));
+            return Err(BlinkClientError::Unauthorized);
         }
         let response = response.error_for_status()?;
 
@@ -120,11 +114,10 @@ impl Client {
             return Err(BlinkClientError::Graphql(envelope.errors));
         }
 
-        envelope.data.and_then(|data| data.me).ok_or_else(|| {
-            BlinkClientError::Graphql(vec![GraphqlError {
-                message: "unauthorized".to_string(),
-            }])
-        })
+        envelope
+            .data
+            .and_then(|data| data.me)
+            .ok_or(BlinkClientError::Unauthorized)
     }
 
     async fn execute<T>(
