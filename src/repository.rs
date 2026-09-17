@@ -3704,6 +3704,135 @@ pub(crate) mod nostr_shared_tests {
         );
     }
 
+    /// Round-3 review regression: an account with TWO independently-proven
+    /// handles keeps the sibling binding when one handle moves away — the
+    /// cleanup is per-handle, never (account, domain)-wide.
+    pub(crate) async fn moving_one_handle_keeps_sibling_binding<
+        DB: LnurlRepository + Send + Sync,
+    >(
+        db: &DB,
+    ) {
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: None,
+            blink_account_id: "blink-siblings".to_string(),
+            btc_wallet_id: "btc".to_string(),
+            usd_wallet_id: "usd".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![
+                NewAccountIdentifier {
+                    domain: DOMAIN.to_string(),
+                    identifier: "sib1".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: String::new(),
+                },
+                NewAccountIdentifier {
+                    domain: DOMAIN.to_string(),
+                    identifier: "sib2".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: String::new(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+        db.upsert_spark_registration(&spark_reg("02a1", "sparky"))
+            .await
+            .unwrap();
+        let source = db
+            .resolve_recipient_by_identifier(DOMAIN, "sib1")
+            .await
+            .unwrap()
+            .expect("sib1 resolves");
+
+        // Both handles independently proven.
+        db.upsert_nostr_identity(&source.account_id, DOMAIN, &"d1".repeat(32), "sib1")
+            .await
+            .unwrap();
+        db.upsert_nostr_identity(&source.account_id, DOMAIN, &"d2".repeat(32), "sib2")
+            .await
+            .unwrap();
+
+        db.transfer_blink_identifier_to_spark(&BlinkToSparkIdentifierTransfer {
+            domain: DOMAIN.to_string(),
+            identifier: "sib1".to_string(),
+            source_account_id: source.account_id.clone(),
+            destination_spark_pubkey: "02a1".to_string(),
+            description: String::new(),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "sib1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the moved handle carries no binding — the new owner must re-prove"
+        );
+        let sibling = db
+            .get_nostr_identity_by_identifier(DOMAIN, "sib2")
+            .await
+            .unwrap()
+            .expect("sibling binding survives the move");
+        assert_eq!(sibling.nostr_pubkey, "d2".repeat(32));
+    }
+
+    /// Round-3 review: a spark transfer displaces the destination's own
+    /// handle — that displaced handle's binding dies, the transferred name
+    /// carries none to the new owner, and nothing else is touched.
+    pub(crate) async fn spark_transfer_scopes_binding_cleanup<DB: LnurlRepository + Send + Sync>(
+        db: &DB,
+    ) {
+        db.upsert_spark_registration(&spark_reg("02b1", "srcname"))
+            .await
+            .unwrap();
+        db.upsert_spark_registration(&spark_reg("02b2", "dstname"))
+            .await
+            .unwrap();
+        let source = db
+            .get_account_by_spark_pubkey("02b1")
+            .await
+            .unwrap()
+            .expect("source account");
+        let destination = db
+            .get_account_by_spark_pubkey("02b2")
+            .await
+            .unwrap()
+            .expect("destination account");
+
+        db.upsert_nostr_identity(&source.account_id, DOMAIN, &"e1".repeat(32), "srcname")
+            .await
+            .unwrap();
+        db.upsert_nostr_identity(&destination.account_id, DOMAIN, &"e2".repeat(32), "dstname")
+            .await
+            .unwrap();
+
+        db.transfer_identifier(&IdentifierTransfer {
+            domain: DOMAIN.to_string(),
+            identifier: "srcname".to_string(),
+            source_account_id: source.account_id.clone(),
+            destination_spark_pubkey: "02b2".to_string(),
+            description: String::new(),
+        })
+        .await
+        .unwrap();
+
+        // The transferred name has no binding at its new owner.
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "srcname")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The destination's displaced handle lost its binding.
+        assert!(
+            db.get_nostr_identity_by_identifier(DOMAIN, "dstname")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// Review M1 regression: a username change must retire the binding that
     /// was proven for the OLD local-part; an idempotent re-registration of
     /// the SAME username must keep it.

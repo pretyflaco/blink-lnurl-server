@@ -458,16 +458,20 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .execute(&mut *tx)
         .await?;
 
-        // A username change retires the proven handle: the existing nostr
-        // binding was proven for the OLD local-part, so it must not survive
-        // the rename. Only an actual replacement clears it — an idempotent
-        // re-registration of the same username keeps the binding.
+        // A username change retires the proven handles that were removed:
+        // those bindings were proven for the OLD local-parts, so they must
+        // not survive. Scoped to the removed names — an idempotent
+        // re-registration of the same username keeps its binding.
         if stale_usernames.rows_affected() > 0 {
-            sqlx::query("DELETE FROM nostr_identities WHERE account_id = $1 AND domain = $2")
-                .bind(&account_id)
-                .bind(&registration.identifier.domain)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "DELETE FROM nostr_identities
+                 WHERE account_id = $1 AND domain = $2 AND username <> $3",
+            )
+            .bind(&account_id)
+            .bind(&registration.identifier.domain)
+            .bind(&registration.identifier.identifier)
+            .execute(&mut *tx)
+            .await?;
         }
 
         sqlx::query(
@@ -813,12 +817,18 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             return Err(LnurlRepositoryError::SourceNotOwner);
         }
 
-        // A nostr mapping must never outlive the username it attests.
-        sqlx::query("DELETE FROM nostr_identities WHERE account_id = $1 AND domain = $2")
-            .bind(&account_id)
-            .bind(domain)
-            .execute(&mut *tx)
-            .await?;
+        // A nostr mapping must never outlive the username it attests —
+        // scoped to the removed identifier so sibling handles of the same
+        // account keep their independently-proven bindings.
+        sqlx::query(
+            "DELETE FROM nostr_identities
+             WHERE account_id = $1 AND domain = $2 AND username = $3",
+        )
+        .bind(&account_id)
+        .bind(domain)
+        .bind(identifier)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit()
             .await
@@ -947,14 +957,28 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .execute(&mut *tx)
         .await?;
 
-        // The handle changed owner: both sides must re-prove their nostr keys
-        // before the mapping is valid again.
-        sqlx::query("DELETE FROM nostr_identities WHERE domain = $1 AND account_id IN ($2, $3)")
-            .bind(&transfer.domain)
-            .bind(&transfer.source_account_id)
-            .bind(&destination_account_id)
-            .execute(&mut *tx)
-            .await?;
+        // The handle changed owner: the SOURCE binding for the transferred
+        // name dies (its proof was the old owner's), and the DESTINATION
+        // loses the bindings of whatever aliases this transfer displaced —
+        // but neither side's siblings are touched (round-3 review).
+        sqlx::query(
+            "DELETE FROM nostr_identities
+             WHERE account_id = $1 AND domain = $2 AND username = $3",
+        )
+        .bind(&transfer.source_account_id)
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM nostr_identities
+             WHERE account_id = $1 AND domain = $2 AND username <> $3",
+        )
+        .bind(&destination_account_id)
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit()
             .await
@@ -1085,15 +1109,29 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .execute(&mut *tx)
         .await?;
 
-        // The handle moved from a blink account to a spark account: both
-        // sides must re-prove their nostr keys before the mapping is valid
-        // again.
-        sqlx::query("DELETE FROM nostr_identities WHERE domain = $1 AND account_id IN ($2, $3)")
-            .bind(&transfer.domain)
-            .bind(&transfer.source_account_id)
-            .bind(&destination_account_id)
-            .execute(&mut *tx)
-            .await?;
+        // The handle moved from a blink account to a spark account: the
+        // SOURCE (which may hold other proven handles — the internal route
+        // provisions several usernames per account) keeps its siblings; only
+        // the transferred name's binding dies, and the DESTINATION loses the
+        // bindings of aliases this transfer displaced.
+        sqlx::query(
+            "DELETE FROM nostr_identities
+             WHERE account_id = $1 AND domain = $2 AND username = $3",
+        )
+        .bind(&transfer.source_account_id)
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM nostr_identities
+             WHERE account_id = $1 AND domain = $2 AND username <> $3",
+        )
+        .bind(&destination_account_id)
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit()
             .await
@@ -2749,6 +2787,22 @@ mod nostr_postgres_tests {
             return;
         };
         nostr_shared_tests::binding_is_per_proven_handle(&db).await;
+    }
+
+    #[tokio::test]
+    async fn moving_one_handle_keeps_sibling_binding() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::moving_one_handle_keeps_sibling_binding(&db).await;
+    }
+
+    #[tokio::test]
+    async fn spark_transfer_scopes_binding_cleanup() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::spark_transfer_scopes_binding_cleanup(&db).await;
     }
 
     /// Round-2 review: deterministic two-connection interleaving — a transfer

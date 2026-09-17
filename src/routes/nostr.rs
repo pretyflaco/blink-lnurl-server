@@ -24,6 +24,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use axum_extra::extract::Host;
 use nostr::{Event, JsonUtil, Kind, TagKind};
 use serde_json::Value;
 use tracing::{debug, trace, warn};
@@ -52,6 +53,7 @@ where
 {
     /// Public NIP-05 lookup: `GET /.well-known/nostr.json?name=<name>`.
     pub async fn handle_nostr_json(
+        Host(host): Host,
         Query(params): Query<HashMap<String, String>>,
         headers: HeaderMap,
         Extension(state): Extension<State<DB>>,
@@ -72,14 +74,11 @@ where
             return Err(not_found());
         }
 
-        // The endpoint is Host-scoped like every other public route — and the
-        // check comes BEFORE the static overlay, so a configured name is never
-        // served for an unapproved Host (review L1).
-        let host = headers
-            .get(axum::http::header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
-            .unwrap_or_default();
+        // The endpoint is Host-scoped like every other public route (same
+        // Host extractor as the LNURL handlers, so proxy deployments resolve
+        // the domain identically across sibling routes) — and the check comes
+        // BEFORE the static overlay, so a configured name is never served for
+        // an unapproved Host (review L1).
         let domain = account::sanitize_domain(&state, &host).await?;
 
         // Static overlay next: immune to the registration lifecycle and
@@ -112,6 +111,7 @@ where
     /// Canonical signed message: `nostr:{nostr_pubkey}-{timestamp}`.
     pub async fn register_nostr(
         Path(pubkey): Path<String>,
+        Host(host): Host,
         headers: HeaderMap,
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<RegisterNostrIdentityRequest>,
@@ -129,7 +129,6 @@ where
             return Err(bad_request("nostr proof too large"));
         }
 
-        let host = host_header(&headers);
         let domain = account::sanitize_domain(&state, &host).await?;
 
         let pubkey = account::validate(
@@ -197,6 +196,7 @@ where
     /// query; the username must already be provisioned in the registry by
     /// Blink Core (internal route) — this route never creates identifiers.
     pub async fn register_nostr_blink(
+        Host(host): Host,
         headers: HeaderMap,
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<RegisterBlinkNostrIdentityRequest>,
@@ -214,7 +214,6 @@ where
             return Err(bad_request("nostr proof too large"));
         }
 
-        let host = host_header(&headers);
         let domain = account::sanitize_domain(&state, &host).await?;
 
         let Some(token) = bearer_token(&headers) else {
@@ -433,20 +432,15 @@ fn nostr_write_error(error: LnurlRepositoryError) -> (StatusCode, Json<Value>) {
     }
 }
 
-fn host_header(headers: &HeaderMap) -> String {
-    headers
-        .get(axum::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string()
-}
-
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
+        // Auth schemes are case-insensitive (RFC 9110 §11.1): accept
+        // `bearer`/`BEARER` alike.
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim())
         .filter(|token| !token.is_empty())
         .map(str::to_string)
 }
@@ -1550,6 +1544,75 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn register_nostr_blink_maps_malformed_200_to_502() {
+        // A 200 envelope with no `data` and no errors is a malformed upstream
+        // response (round-3 review LOW 2) — an outage, not an auth failure.
+        let endpoint = start_blink_me_mock_server(MeMock::Malformed200).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_recipient("alice"));
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        let app = Router::new()
+            .route(
+                "/nostr/blink",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr_blink),
+            )
+            .layer(Extension(state));
+        let nostr_keys = Keys::generate();
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/nostr/blink",
+            Some("Bearer good-token"),
+            Some(json!({
+                "nostr_pubkey": nostr_keys.public_key().to_hex(),
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn register_nostr_blink_accepts_lowercase_bearer_scheme() {
+        // Auth schemes are case-insensitive (round-3 review LOW 3).
+        let endpoint = start_blink_me_mock_server(MeMock::Ok("alice")).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_recipient("alice"));
+        let state =
+            internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
+        let app = Router::new()
+            .route(
+                "/nostr/blink",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr_blink),
+            )
+            .layer(Extension(state));
+        let nostr_keys = Keys::generate();
+        let nostr_pubkey = nostr_keys.public_key().to_hex();
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/nostr/blink",
+            Some("bearer good-token"),
+            Some(json!({
+                "nostr_pubkey": nostr_pubkey,
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            repo.nostr_identity("acct_blink", DOMAIN),
+            Some(nostr_pubkey)
+        );
     }
 
     #[tokio::test]

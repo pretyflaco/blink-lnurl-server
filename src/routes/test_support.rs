@@ -1170,6 +1170,8 @@ pub(super) enum MeMock {
     HttpUnauthorized,
     /// Plain HTTP 403 from an edge/gateway in front of GraphQL.
     HttpForbidden,
+    /// HTTP 200 with a malformed envelope (no `data`, no errors).
+    Malformed200,
 }
 
 pub(super) async fn start_blink_me_mock_server(mode: MeMock) -> String {
@@ -1206,6 +1208,7 @@ pub(super) async fn start_blink_me_mock_server(mode: MeMock) -> String {
                     axum::http::StatusCode::OK,
                     json!({ "errors": [{"message": "internal resolver failure"}] }),
                 ),
+                MeMock::Malformed200 => (axum::http::StatusCode::OK, json!({})),
             };
             (status, Json(body)).into_response()
         }),
