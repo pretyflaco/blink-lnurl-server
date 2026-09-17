@@ -99,8 +99,21 @@ impl Client {
             .bearer_auth(token)
             .json(&json!({ "query": ME_OPERATION }))
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        // Preserve HTTP-level auth failures as auth errors (review L3): a
+        // 401/403 from the gateway must surface as unauthorized, not as an
+        // upstream outage. Transport and server failures stay what they are.
+        let status = response.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| String::from("unauthorized"));
+            return Err(BlinkClientError::Graphql(vec![GraphqlError {
+                message: format!("unauthorized (HTTP {}): {body}", status.as_u16()),
+            }]));
+        }
+        let response = response.error_for_status()?;
 
         let envelope = response.json::<GraphqlEnvelope<MeData>>().await?;
         if !envelope.errors.is_empty() {

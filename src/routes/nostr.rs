@@ -33,7 +33,7 @@ use crate::models::{
     ERROR_RATE_LIMITED, NostrJsonResponse, RegisterBlinkNostrIdentityRequest,
     RegisterNostrIdentityRequest, RegisterNostrIdentityResponse,
 };
-use crate::repository::{AccountProvider, LnurlRepository};
+use crate::repository::{AccountProvider, LnurlRepository, LnurlRepositoryError};
 use crate::routes::{LnurlServer, account};
 use crate::state::State;
 use crate::time::now_u64;
@@ -72,20 +72,24 @@ where
             return Err(not_found());
         }
 
-        // Static overlay first: immune to the registration lifecycle and
-        // covers service identities (the `_` domain root, official keys).
-        if let Some(pubkey) = state.nostr_static_names.get(name) {
-            return Ok(nostr_json_response(name, pubkey));
-        }
-
-        // The endpoint is Host-scoped like every other public route: the
-        // domain of the handle must match the domain being queried.
+        // The endpoint is Host-scoped like every other public route — and the
+        // check comes BEFORE the static overlay, so a configured name is never
+        // served for an unapproved Host (review L1).
         let host = headers
             .get(axum::http::header::HOST)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string)
             .unwrap_or_default();
         let domain = account::sanitize_domain(&state, &host).await?;
+
+        // Static overlay next: immune to the registration lifecycle and
+        // covers service identities (the `_` domain root, official keys).
+        // Intentionally global across the served domains (single-domain
+        // deployments today); per-domain keying is a follow-up if multi-domain
+        // official identities are ever needed.
+        if let Some(pubkey) = state.nostr_static_names.get(name) {
+            return Ok(nostr_json_response(name, pubkey));
+        }
 
         match state
             .db
@@ -170,13 +174,14 @@ where
             &payload.nostr_proof,
             &nostr_pubkey,
             &format!("{username}@{domain}"),
+            now_u64(),
         )?;
 
         state
             .db
-            .upsert_nostr_identity(&spark_account.account_id, &domain, &nostr_pubkey)
+            .upsert_nostr_identity(&spark_account.account_id, &domain, &nostr_pubkey, &username)
             .await
-            .map_err(account::storage_error)?;
+            .map_err(nostr_write_error)?;
 
         debug!("registered nostr identity {nostr_pubkey} for {username}@{domain}");
         Ok(Json(RegisterNostrIdentityResponse {
@@ -196,6 +201,7 @@ where
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<RegisterBlinkNostrIdentityRequest>,
     ) -> Result<Json<RegisterNostrIdentityResponse>, (StatusCode, Json<Value>)> {
+        require_blink_provider_enabled(&state)?;
         if !state.ip_rate_limiter.check(client_ip(&headers)) {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
@@ -269,18 +275,30 @@ where
                 Json(Value::String("username mismatch".into())),
             ));
         }
+        // Fail-closed on a stale/misprovisioned registry: the token's account
+        // and the registry's owner of the username must be the same Blink
+        // account (review divergence: compare me.id, not just the username).
+        if recipient.blink_account_id.as_deref() != Some(me.id.as_str()) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(Value::String(
+                    "registry entry belongs to a different blink account".into(),
+                )),
+            ));
+        }
 
         verify_nostr_identity_proof(
             &payload.nostr_proof,
             &nostr_pubkey,
             &format!("{username}@{domain}"),
+            now_u64(),
         )?;
 
         state
             .db
-            .upsert_nostr_identity(&recipient.account_id, &domain, &nostr_pubkey)
+            .upsert_nostr_identity(&recipient.account_id, &domain, &nostr_pubkey, &username)
             .await
-            .map_err(account::storage_error)?;
+            .map_err(nostr_write_error)?;
 
         debug!(
             "registered nostr identity {nostr_pubkey} for blink account {} ({username}@{domain})",
@@ -303,6 +321,7 @@ pub(super) fn verify_nostr_identity_proof(
     nostr_proof: &str,
     nostr_pubkey: &str,
     expected_lnaddress: &str,
+    now: u64,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     let event = Event::from_json(nostr_proof).map_err(|e| {
         trace!("invalid nostr proof, could not parse: {e}");
@@ -325,7 +344,6 @@ pub(super) fn verify_nostr_identity_proof(
         return Err(bad_request("nostr proof key mismatch"));
     }
 
-    let now = now_u64();
     if event.created_at.as_secs().abs_diff(now) > super::ACCEPTABLE_TIME_DIFF_SECS {
         trace!(
             "nostr proof timestamp too far off: {}, now: {}",
@@ -352,12 +370,26 @@ pub(super) fn verify_nostr_identity_proof(
 }
 
 /// NIP-05 local-part charset: `a-z0-9-_.` (lowercase only, per spec).
-pub(super) fn valid_nip05_local_part(name: &str) -> bool {
+/// Shared with the static-overlay config validation in main — keep one truth.
+pub(crate) fn is_valid_nip05_local_part(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name.bytes().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
         })
+}
+
+/// Canonical nostr identity pubkey: exactly 64 lowercase hex chars.
+pub(crate) fn is_canonical_nostr_pubkey(hex: &str) -> bool {
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Route-facing wrapper for local-part validation.
+pub(super) fn valid_nip05_local_part(name: &str) -> bool {
+    is_valid_nip05_local_part(name)
 }
 
 /// Accept only canonical lowercase 64-char hex x-only pubkeys. Refuse npubs
@@ -366,15 +398,41 @@ pub(super) fn normalize_nostr_pubkey(
     nostr_pubkey: &str,
 ) -> Result<String, (StatusCode, Json<Value>)> {
     let trimmed = nostr_pubkey.trim();
-    if trimmed.len() == 64
-        && trimmed
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
+    if is_canonical_nostr_pubkey(trimmed) {
         return Ok(trimmed.to_string());
     }
     trace!("invalid nostr pubkey format: {trimmed:?}");
     Err(bad_request("invalid nostr pubkey"))
+}
+
+/// Blink-provider gate for the blink nostr route, mirroring the spark guard
+/// (review L2): a deployment that disabled the Blink provider must not mutate
+/// NIP-05 state through it.
+fn require_blink_provider_enabled<DB>(state: &State<DB>) -> Result<(), (StatusCode, Json<Value>)> {
+    if state.providers.blink_enabled() {
+        return Ok(());
+    }
+
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(Value::String(
+            crate::models::INTERNAL_ERROR_PROVIDER_DISABLED.to_string(),
+        )),
+    ))
+}
+
+/// Map repository write failures: losing ownership of the exact username
+/// between proof and write is a conflict, everything else is a storage error.
+fn nostr_write_error(error: LnurlRepositoryError) -> (StatusCode, Json<Value>) {
+    match error {
+        LnurlRepositoryError::InvalidOwnership => (
+            StatusCode::CONFLICT,
+            Json(Value::String(
+                "username is no longer owned by this account".into(),
+            )),
+        ),
+        other => account::storage_error(other),
+    }
 }
 
 fn host_header(headers: &HeaderMap) -> String {
@@ -416,13 +474,14 @@ fn bad_request(message: &str) -> (StatusCode, Json<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository::LnurlRepositoryError;
     use crate::repository::{
         AccountIdentifierKind, AccountProvider, NewAccountIdentifier, NewSparkRegistration,
         ResolvedRecipient,
     };
     use crate::routes::test_support::{
-        MockRepository, Request, Router, ServiceExt, StatusCode, Value,
-        internal_route_test_state_with_blink_endpoint, json,
+        MeMock, MockRepository, Request, Router, ServiceExt, StatusCode, Value,
+        internal_route_test_state_full, internal_route_test_state_with_blink_endpoint, json,
         route_test_state_with_country_resolver, start_blink_me_mock_server,
     };
     use nostr::{EventBuilder, Keys, Tag};
@@ -430,10 +489,29 @@ mod tests {
     const DOMAIN: &str = "localhost:8080";
 
     fn proof_event(keys: &Keys, lnaddress: &str, kind: Kind) -> String {
-        let event = EventBuilder::new(kind, "")
-            .tags([Tag::parse(["lnaddress", lnaddress]).expect("test tag parses")])
-            .sign_with_keys(keys)
-            .expect("test proof signs");
+        proof_event_at(keys, &[["lnaddress", lnaddress]], kind, None)
+    }
+
+    /// Proof builder with full control: arbitrary tags, and a created_at
+    /// offset (seconds from now) for freshness tests.
+    fn proof_event_at(
+        keys: &Keys,
+        tags: &[[&str; 2]],
+        kind: Kind,
+        created_at_offset: Option<i64>,
+    ) -> String {
+        let created_at = match created_at_offset {
+            Some(offset) => now_u64().saturating_add_signed(offset),
+            None => now_u64(),
+        };
+        let parsed: Vec<Tag> = tags
+            .iter()
+            .map(|t| Tag::parse([t[0], t[1]]).expect("test tag parses"))
+            .collect();
+        let builder = EventBuilder::new(kind, "")
+            .tags(parsed)
+            .custom_created_at(created_at.into());
+        let event = builder.sign_with_keys(keys).expect("test proof signs");
         event.as_json()
     }
 
@@ -503,7 +581,8 @@ mod tests {
             verify_nostr_identity_proof(
                 &proof,
                 &keys.public_key().to_hex(),
-                "alice@localhost:8080"
+                "alice@localhost:8080",
+                now_u64()
             )
             .is_ok()
         );
@@ -513,7 +592,8 @@ mod tests {
             verify_nostr_identity_proof(
                 &proof,
                 &keys.public_key().to_hex(),
-                "alice@localhost:8080"
+                "alice@localhost:8080",
+                now_u64()
             )
             .is_ok()
         );
@@ -527,18 +607,25 @@ mod tests {
 
         // Wrong kind.
         let proof = proof_event(&keys, "alice@localhost:8080", Kind::TextNote);
-        assert!(verify_nostr_identity_proof(&proof, &pubkey, "alice@localhost:8080").is_err());
+        assert!(
+            verify_nostr_identity_proof(&proof, &pubkey, "alice@localhost:8080", now_u64())
+                .is_err()
+        );
 
         // Wrong lnaddress binding.
         let proof = proof_event(&keys, "alice@localhost:8080", Kind::Authentication);
-        assert!(verify_nostr_identity_proof(&proof, &pubkey, "mallory@localhost:8080").is_err());
+        assert!(
+            verify_nostr_identity_proof(&proof, &pubkey, "mallory@localhost:8080", now_u64())
+                .is_err()
+        );
 
         // Claimed key differs from signing key (impersonation attempt).
         assert!(
             verify_nostr_identity_proof(
                 &proof,
                 &other_keys.public_key().to_hex(),
-                "alice@localhost:8080"
+                "alice@localhost:8080",
+                now_u64()
             )
             .is_err()
         );
@@ -548,7 +635,13 @@ mod tests {
             .sign_with_keys(&keys)
             .expect("test event signs");
         assert!(
-            verify_nostr_identity_proof(&event.as_json(), &pubkey, "alice@localhost:8080").is_err()
+            verify_nostr_identity_proof(
+                &event.as_json(),
+                &pubkey,
+                "alice@localhost:8080",
+                now_u64()
+            )
+            .is_err()
         );
     }
 
@@ -781,7 +874,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_nostr_blink_binds_provisioned_username() {
-        let endpoint = start_blink_me_mock_server(Some("alice")).await;
+        let endpoint = start_blink_me_mock_server(MeMock::Ok("alice")).await;
         let repo = MockRepository::default().with_resolved_recipient(blink_recipient("alice"));
         let state =
             internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
@@ -817,9 +910,458 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proof_verifier_rejects_stale_and_future_proofs() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key().to_hex();
+        let lnaddress = "alice@localhost:8080";
+
+        let stale = proof_event_at(
+            &keys,
+            &[["lnaddress", lnaddress]],
+            Kind::Authentication,
+            Some(-(super::super::ACCEPTABLE_TIME_DIFF_SECS as i64) * 2),
+        );
+        assert!(verify_nostr_identity_proof(&stale, &pubkey, lnaddress, now_u64()).is_err());
+
+        let future = proof_event_at(
+            &keys,
+            &[["lnaddress", lnaddress]],
+            Kind::Authentication,
+            Some((super::super::ACCEPTABLE_TIME_DIFF_SECS as i64) * 2),
+        );
+        assert!(verify_nostr_identity_proof(&future, &pubkey, lnaddress, now_u64()).is_err());
+
+        // Within the window passes.
+        let fresh = proof_event_at(
+            &keys,
+            &[["lnaddress", lnaddress]],
+            Kind::Authentication,
+            Some(-30),
+        );
+        assert!(verify_nostr_identity_proof(&fresh, &pubkey, lnaddress, now_u64()).is_ok());
+    }
+
+    #[test]
+    fn proof_verifier_rejects_duplicate_lnaddress_tags() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key().to_hex();
+        let lnaddress = "alice@localhost:8080";
+        let proof = proof_event_at(
+            &keys,
+            &[["lnaddress", lnaddress], ["lnaddress", lnaddress]],
+            Kind::Authentication,
+            None,
+        );
+        assert!(
+            verify_nostr_identity_proof(&proof, &pubkey, lnaddress, now_u64()).is_err(),
+            "exactly one lnaddress tag is required"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_nostr_rejects_oversized_proof() {
+        let nostr_keys = Keys::generate();
+        let nostr_pubkey = nostr_keys.public_key().to_hex();
+        let timestamp = now_u64();
+        let auth =
+            spark_client::Client::build_auth_payload(&format!("nostr:{nostr_pubkey}"), timestamp)
+                .await
+                .expect("test auth payload signs");
+        let repo = MockRepository::default().with_spark_mode(&auth.pubkey, None);
+        repo.spark_registrations
+            .lock()
+            .unwrap()
+            .push(spark_registration(&auth.pubkey, "alice"));
+        let state = route_test_state_with_country_resolver(
+            repo,
+            crate::country::CountryResolver::disabled(),
+        )
+        .await;
+        let app = Router::new()
+            .route(
+                "/lnurlpay/{pubkey}/nostr",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr),
+            )
+            .layer(Extension(state));
+
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            &format!("/lnurlpay/{}/nostr", auth.pubkey),
+            None,
+            Some(json!({
+                "nostr_pubkey": nostr_pubkey,
+                "nostr_proof": "0".repeat(super::super::MAX_NOSTR_EVENT_SIZE + 1),
+                "signature": auth.register_signature,
+                "timestamp": timestamp,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn register_nostr_rejects_unknown_account_or_missing_username() {
+        let nostr_keys = Keys::generate();
+        let nostr_pubkey = nostr_keys.public_key().to_hex();
+        let timestamp = now_u64();
+        let auth =
+            spark_client::Client::build_auth_payload(&format!("nostr:{nostr_pubkey}"), timestamp)
+                .await
+                .expect("test auth payload signs");
+
+        // Valid spark signature, but no account exists for the pubkey.
+        let repo = MockRepository::default();
+        let state = route_test_state_with_country_resolver(
+            repo,
+            crate::country::CountryResolver::disabled(),
+        )
+        .await;
+        let app = Router::new()
+            .route(
+                "/lnurlpay/{pubkey}/nostr",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr),
+            )
+            .layer(Extension(state));
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            &format!("/lnurlpay/{}/nostr", auth.pubkey),
+            None,
+            Some(json!({
+                "nostr_pubkey": nostr_pubkey,
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+                "signature": auth.register_signature,
+                "timestamp": timestamp,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Account exists, but no username on this domain.
+        let repo = MockRepository::default().with_spark_mode(&auth.pubkey, None);
+        let state = route_test_state_with_country_resolver(
+            repo,
+            crate::country::CountryResolver::disabled(),
+        )
+        .await;
+        let app = Router::new()
+            .route(
+                "/lnurlpay/{pubkey}/nostr",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr),
+            )
+            .layer(Extension(state));
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            &format!("/lnurlpay/{}/nostr", auth.pubkey),
+            None,
+            Some(json!({
+                "nostr_pubkey": nostr_pubkey,
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+                "signature": auth.register_signature,
+                "timestamp": timestamp,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn register_nostr_spark_surfaces_storage_failure() {
+        let nostr_keys = Keys::generate();
+        let nostr_pubkey = nostr_keys.public_key().to_hex();
+        let timestamp = now_u64();
+        let auth =
+            spark_client::Client::build_auth_payload(&format!("nostr:{nostr_pubkey}"), timestamp)
+                .await
+                .expect("test auth payload signs");
+        let repo = MockRepository::default().with_spark_mode(&auth.pubkey, None);
+        repo.spark_registrations
+            .lock()
+            .unwrap()
+            .push(spark_registration(&auth.pubkey, "alice"));
+        repo.fail_next_nostr_upsert(LnurlRepositoryError::General(anyhow::anyhow!(
+            "disk on fire"
+        )));
+        let state = route_test_state_with_country_resolver(
+            repo,
+            crate::country::CountryResolver::disabled(),
+        )
+        .await;
+        let app = Router::new()
+            .route(
+                "/lnurlpay/{pubkey}/nostr",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr),
+            )
+            .layer(Extension(state));
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            &format!("/lnurlpay/{}/nostr", auth.pubkey),
+            None,
+            Some(json!({
+                "nostr_pubkey": nostr_pubkey,
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+                "signature": auth.register_signature,
+                "timestamp": timestamp,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn nostr_json_rejects_unapproved_host_even_for_overlay_names() {
+        let repo = MockRepository::default();
+        let mut state = route_test_state_with_country_resolver(
+            repo,
+            crate::country::CountryResolver::disabled(),
+        )
+        .await;
+        let mut overlay = std::collections::BTreeMap::new();
+        overlay.insert("_".to_string(), "22".repeat(32));
+        state.nostr_static_names = std::sync::Arc::new(overlay);
+        // Restrict the allowed domains so localhost:8080 is unapproved.
+        *state.domains.write().await = std::collections::HashSet::from(["blink.sv".to_string()]);
+        let app = nostr_json_app(state);
+
+        let (status, _) = call(
+            app.clone(),
+            "GET",
+            "/.well-known/nostr.json?name=_",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "overlay must not bypass Host validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn nostr_json_rate_limits_headerless_requests_in_production_posture() {
+        let repo = MockRepository::default();
+        let mut state = route_test_state_with_country_resolver(
+            repo,
+            crate::country::CountryResolver::disabled(),
+        )
+        .await;
+        // Production posture: tight budget, fail-closed without a trusted header.
+        state.nostr_json_rate_limiter =
+            std::sync::Arc::new(crate::rate_limit::PerIpRateLimiter::new(
+                1,
+                std::time::Duration::from_mins(1),
+                10,
+                false,
+            ));
+        let app = nostr_json_app(state);
+
+        // Fail-closed posture: without a trusted client-IP header every
+        // lookup is refused outright in production (they never even reach
+        // the budget — direct-to-origin traffic is not a legitimate path).
+        for _ in 0..2 {
+            let (status, _) = call(
+                app.clone(),
+                "GET",
+                "/.well-known/nostr.json?name=nobody",
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
+    #[tokio::test]
+    async fn register_nostr_blink_rejects_when_blink_provider_disabled() {
+        let endpoint = start_blink_me_mock_server(MeMock::Ok("alice")).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_recipient("alice"));
+        let state = internal_route_test_state_full(
+            repo,
+            None,
+            &endpoint,
+            true,
+            false,
+            crate::country::CountryResolver::disabled(),
+        )
+        .await;
+        let app = Router::new()
+            .route(
+                "/nostr/blink",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr_blink),
+            )
+            .layer(Extension(state));
+        let nostr_keys = Keys::generate();
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/nostr/blink",
+            Some("Bearer good-token"),
+            Some(json!({
+                "nostr_pubkey": nostr_keys.public_key().to_hex(),
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+        assert_eq!(body, json!("provider_disabled"));
+    }
+
+    #[tokio::test]
+    async fn register_nostr_blink_rejects_registry_account_mismatch() {
+        // `me` authenticates blink-account-1, but the registry entry for
+        // `alice` belongs to a different blink account (stale provisioning).
+        let endpoint = start_blink_me_mock_server(MeMock::Ok("alice")).await;
+        let mut recipient = blink_recipient("alice");
+        recipient.blink_account_id = Some("blink-account-OTHER".to_string());
+        let repo = MockRepository::default().with_resolved_recipient(recipient);
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        let app = Router::new()
+            .route(
+                "/nostr/blink",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr_blink),
+            )
+            .layer(Extension(state));
+        let nostr_keys = Keys::generate();
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/nostr/blink",
+            Some("Bearer good-token"),
+            Some(json!({
+                "nostr_pubkey": nostr_keys.public_key().to_hex(),
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn register_nostr_blink_rejects_non_blink_recipient() {
+        let endpoint = start_blink_me_mock_server(MeMock::Ok("alice")).await;
+        let mut recipient = blink_recipient("alice");
+        recipient.provider = AccountProvider::Spark;
+        recipient.spark_pubkey = Some("02ab".to_string());
+        let repo = MockRepository::default().with_resolved_recipient(recipient);
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        let app = Router::new()
+            .route(
+                "/nostr/blink",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr_blink),
+            )
+            .layer(Extension(state));
+        let nostr_keys = Keys::generate();
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/nostr/blink",
+            Some("Bearer good-token"),
+            Some(json!({
+                "nostr_pubkey": nostr_keys.public_key().to_hex(),
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn register_nostr_blink_maps_upstream_http_401_to_unauthorized() {
+        // A gateway 401 (not a GraphQL-envelope error) must surface as 401,
+        // not as a 502 upstream outage (review L3).
+        let endpoint = start_blink_me_mock_server(MeMock::HttpUnauthorized).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_recipient("alice"));
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        let app = Router::new()
+            .route(
+                "/nostr/blink",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr_blink),
+            )
+            .layer(Extension(state));
+        let nostr_keys = Keys::generate();
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/nostr/blink",
+            Some("Bearer good-token"),
+            Some(json!({
+                "nostr_pubkey": nostr_keys.public_key().to_hex(),
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn register_nostr_blink_rejects_lost_ownership_between_proof_and_write() {
+        // The username is provisioned to the authenticated account, but the
+        // registry ownership check fails at write time (renamed concurrently).
+        let endpoint = start_blink_me_mock_server(MeMock::Ok("alice")).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_recipient("alice"));
+        repo.fail_next_nostr_upsert(LnurlRepositoryError::InvalidOwnership);
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        let app = Router::new()
+            .route(
+                "/nostr/blink",
+                axum::routing::post(LnurlServer::<MockRepository>::register_nostr_blink),
+            )
+            .layer(Extension(state));
+        let nostr_keys = Keys::generate();
+        let (status, _) = call(
+            app.clone(),
+            "POST",
+            "/nostr/blink",
+            Some("Bearer good-token"),
+            Some(json!({
+                "nostr_pubkey": nostr_keys.public_key().to_hex(),
+                "nostr_proof": proof_event(
+                    &nostr_keys,
+                    "alice@localhost:8080",
+                    Kind::Authentication
+                ),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
     #[tokio::test]
     async fn register_nostr_blink_rejects_bad_token_and_unprovisioned_username() {
-        let endpoint = start_blink_me_mock_server(Some("alice")).await;
+        let endpoint = start_blink_me_mock_server(MeMock::Ok("alice")).await;
 
         // Valid token, but the username is not provisioned in the registry.
         let repo = MockRepository::default();

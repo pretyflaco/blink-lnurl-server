@@ -366,16 +366,9 @@ fn parse_nostr_static_names(
     let parsed: std::collections::BTreeMap<String, String> =
         serde_json::from_str(raw).map_err(|e| anyhow!("invalid nostr_static_names JSON: {e:?}"))?;
     for (name, pubkey) in &parsed {
-        let valid_name = !name.is_empty()
-            && name.len() <= 64
-            && name.bytes().all(|b| {
-                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
-            });
-        let valid_pubkey = pubkey.len() == 64
-            && pubkey
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
-        if !valid_name || !valid_pubkey {
+        if !routes::nostr::is_valid_nip05_local_part(name)
+            || !routes::nostr::is_canonical_nostr_pubkey(pubkey)
+        {
             return Err(anyhow!(
                 "invalid nostr_static_names entry '{name}': names must match the NIP-05 \
                  local-part charset and pubkeys must be 64-char lowercase hex"
@@ -599,7 +592,11 @@ where
         args.nostr_json_requests_per_ip_per_minute,
         std::time::Duration::from_mins(1),
         RATE_LIMIT_TRACKED_IPS,
-        true,
+        // Same trusted-header posture as the signed-request limiter (review
+        // M2): production rejects requests without a trusted client-IP header
+        // (direct-to-origin traffic or a misconfigured edge gets no unlimited
+        // DB-backed lookups); local/dev stays permissive for shell testing.
+        runtime_config.local_env,
     ));
 
     let country_lookup_budget = Arc::new(rate_limit::GlobalBudget::new(
@@ -851,8 +848,37 @@ fn register_webhook(spark_client: spark_client::Client, webhook_url: String, sec
 mod tests {
     use super::*;
 
+    const NOSTR_HEX: &str = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2";
+
     fn default_args() -> Args {
         Args::parse_from(["lnurl-server"])
+    }
+
+    #[test]
+    fn nostr_static_names_parses_valid_overlay() {
+        let raw = format!(r#"{{"_":"{NOSTR_HEX}","team":"{NOSTR_HEX}"}}"#);
+        let parsed = parse_nostr_static_names(Some(&raw)).expect("valid overlay parses");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed["_"], NOSTR_HEX);
+    }
+
+    #[test]
+    fn nostr_static_names_rejects_invalid_entries_and_json() {
+        assert!(parse_nostr_static_names(Some("not json")).is_err());
+        // Uppercase name (not the NIP-05 local-part charset).
+        let upper_name = format!(r#"{{"Alice":"{NOSTR_HEX}"}}"#);
+        assert!(parse_nostr_static_names(Some(&upper_name)).is_err());
+        // Non-hex, short, and uppercase pubkeys.
+        assert!(parse_nostr_static_names(Some(r#"{"_":"zz"}"#)).is_err());
+        let short = format!(r#"{{"_":"{}"}}"#, &NOSTR_HEX[..63]);
+        assert!(parse_nostr_static_names(Some(&short)).is_err());
+        let upper = format!(r#"{{"_":"{}"}}"#, NOSTR_HEX.to_uppercase());
+        assert!(parse_nostr_static_names(Some(&upper)).is_err());
+    }
+
+    #[test]
+    fn nostr_static_names_none_is_empty() {
+        assert!(parse_nostr_static_names(None).unwrap().is_empty());
     }
 
     #[test]

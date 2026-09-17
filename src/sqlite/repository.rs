@@ -268,11 +268,22 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         account_id: &str,
         domain: &str,
         nostr_pubkey: &str,
+        username: &str,
     ) -> Result<(), LnurlRepositoryError> {
         let now = now_millis();
-        sqlx::query(
+        // The write only lands while the account currently owns the exact
+        // username the proof attests — a transferred or renamed handle can
+        // never carry a binding it did not earn.
+        let result = sqlx::query(
             "INSERT INTO nostr_identities (account_id, domain, nostr_pubkey, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $4)
+             SELECT $1, $2, $3, $4, $4
+             WHERE EXISTS (
+                 SELECT 1 FROM account_identifiers ai
+                 WHERE ai.account_id = $1
+                   AND ai.domain = $2
+                   AND ai.identifier = $5
+                   AND ai.identifier_kind = 'username'
+             )
              ON CONFLICT (account_id, domain)
              DO UPDATE SET nostr_pubkey = excluded.nostr_pubkey
              ,              updated_at = excluded.updated_at",
@@ -281,8 +292,12 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(domain)
         .bind(nostr_pubkey)
         .bind(now)
+        .bind(username)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(LnurlRepositoryError::InvalidOwnership);
+        }
         Ok(())
     }
 
@@ -407,7 +422,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             return Err(LnurlRepositoryError::InvalidOwnership);
         }
 
-        sqlx::query(
+        let stale_usernames = sqlx::query(
             "DELETE FROM account_identifiers
              WHERE account_id = $1
              AND domain = $2
@@ -419,6 +434,18 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&registration.identifier.identifier)
         .execute(&mut *tx)
         .await?;
+
+        // A username change retires the proven handle: the existing nostr
+        // binding was proven for the OLD local-part, so it must not survive
+        // the rename. Only an actual replacement clears it — an idempotent
+        // re-registration of the same username keeps the binding.
+        if stale_usernames.rows_affected() > 0 {
+            sqlx::query("DELETE FROM nostr_identities WHERE account_id = $1 AND domain = $2")
+                .bind(&account_id)
+                .bind(&registration.identifier.domain)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         sqlx::query(
             "INSERT INTO accounts (account_id, provider, created_at, updated_at)
@@ -2408,5 +2435,65 @@ mod provider_neutral_tests {
     async fn register_after_mode_attaches_to_the_same_account() {
         let db = setup_test_db().await;
         shared_tests::register_after_mode_attaches_to_the_same_account(&db).await;
+    }
+}
+
+#[cfg(test)]
+mod nostr_sqlite_tests {
+    use super::LnurlRepository;
+    use crate::repository::nostr_shared_tests;
+
+    async fn setup() -> LnurlRepository {
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        crate::sqlite::run_migrations(&pool).await.unwrap();
+        LnurlRepository::new(pool)
+    }
+
+    #[tokio::test]
+    async fn insert_and_lookup() {
+        let db = setup().await;
+        nostr_shared_tests::insert_and_lookup(&db).await;
+    }
+
+    #[tokio::test]
+    async fn lookup_misses_wrong_domain_or_identifier() {
+        let db = setup().await;
+        nostr_shared_tests::lookup_misses_wrong_domain_or_identifier(&db).await;
+    }
+
+    #[tokio::test]
+    async fn replace_updates_pubkey() {
+        let db = setup().await;
+        nostr_shared_tests::replace_updates_pubkey(&db).await;
+    }
+
+    #[tokio::test]
+    async fn upsert_requires_username_ownership() {
+        let db = setup().await;
+        nostr_shared_tests::upsert_requires_username_ownership(&db).await;
+    }
+
+    #[tokio::test]
+    async fn unregister_clears_binding() {
+        let db = setup().await;
+        nostr_shared_tests::unregister_clears_binding(&db).await;
+    }
+
+    #[tokio::test]
+    async fn spark_transfer_clears_both_sides() {
+        let db = setup().await;
+        nostr_shared_tests::spark_transfer_clears_both_sides(&db).await;
+    }
+
+    #[tokio::test]
+    async fn blink_to_spark_transfer_clears_binding() {
+        let db = setup().await;
+        nostr_shared_tests::blink_to_spark_transfer_clears_binding(&db).await;
+    }
+
+    #[tokio::test]
+    async fn username_replacement_clears_binding() {
+        let db = setup().await;
+        nostr_shared_tests::username_replacement_clears_binding(&db).await;
     }
 }
